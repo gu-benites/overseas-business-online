@@ -1,0 +1,388 @@
+import random
+import requests
+import shutil
+import string
+import traceback
+from argparse import ArgumentParser
+from datetime import datetime
+from itertools import chain, filterfalse, zip_longest
+from pathlib import Path
+from time import sleep
+from typing import Optional
+from urllib.parse import quote_plus
+
+import hooks
+from clicklogs_db import ClickLogsDB
+from config_reader import config
+from logger import logger, update_log_formats
+from proxy import get_proxies
+from search_controller import SearchController
+from utils import (
+    get_random_user_agent_string,
+    get_domains,
+    take_screenshot,
+    generate_click_report,
+)
+from webdriver import _get_browser_binary_path, create_webdriver
+
+
+if config.behavior.telegram_enabled:
+    from telegram_notifier import notify_matching_ads, start_bot
+
+
+__author__ = "Coşkun Deniz <coskun.denize@gmail.com>"
+
+SMOKE_TEST_URL = "https://ipv4.icanhazip.com"
+SMOKE_TEST_SCREENSHOT_DIR = Path.cwd() / ".streamlit_uploads" / "smoke_test_screenshots"
+
+
+def get_arg_parser() -> ArgumentParser:
+    """Get argument parser
+
+    :rtype: ArgumentParser
+    :returns: ArgumentParser object
+    """
+
+    arg_parser = ArgumentParser(add_help=False, usage="See README.md file")
+    arg_parser.add_argument("-q", "--query", help="Search query")
+    arg_parser.add_argument(
+        "-p",
+        "--proxy",
+        help="""Use the given proxy in "ip:port" or "username:password@host:port" format""",
+    )
+    arg_parser.add_argument("--id", help="Browser id for multiprocess run")
+    arg_parser.add_argument(
+        "--enable_telegram", action="store_true", help="Enable telegram notifications"
+    )
+    arg_parser.add_argument(
+        "--report_clicks", action="store_true", help="Get click report for the given date"
+    )
+    arg_parser.add_argument("--date", help="Give a specific report date in DD-MM-YYYY format")
+    arg_parser.add_argument("--excel", action="store_true", help="Write results to an Excel file")
+    arg_parser.add_argument(
+        "--check_stealth", action="store_true", help="Check stealth for undetection"
+    )
+    arg_parser.add_argument(
+        "--smoke_test",
+        action="store_true",
+        help="Launch the browser with the current proxy, open a neutral page, and exit",
+    )
+    arg_parser.add_argument("-d", "--device_id", help="Android device ID for assigning to browser")
+
+    return arg_parser
+
+
+def _build_playwright_proxy(proxy: Optional[str]) -> Optional[dict[str, str]]:
+    """Convert the existing proxy string format into Playwright launch config."""
+
+    if not proxy:
+        return None
+
+    if config.webdriver.auth:
+        if "@" not in proxy or proxy.count(":") < 2:
+            raise ValueError(
+                "Invalid proxy format! Should be in 'username:password@host:port' format"
+            )
+
+        auth_part, server_part = proxy.split("@", 1)
+        username, password = auth_part.split(":", 1)
+        host, port = server_part.rsplit(":", 1)
+
+        return {
+            "server": f"http://{host}:{port}",
+            "username": username,
+            "password": password,
+        }
+
+    proxy_server = proxy if "://" in proxy else f"http://{proxy}"
+    return {"server": proxy_server}
+
+
+def _build_requests_proxies(proxy: Optional[str]) -> Optional[dict[str, str]]:
+    if not proxy:
+        return None
+
+    proxy_url = proxy if "://" in proxy else f"http://{proxy}"
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def _build_smoke_test_target(query: Optional[str]) -> str:
+    if not query:
+        return SMOKE_TEST_URL
+
+    return f"https://www.google.com/search?q={quote_plus(query)}"
+
+
+def _save_smoke_test_screenshot(page, query: str) -> Path:
+    SMOKE_TEST_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    query_slug = "-".join(query.lower().split())[:60] or "smoke-test"
+    filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{query_slug}.png"
+    screenshot_path = SMOKE_TEST_SCREENSHOT_DIR / filename
+    page.screenshot(path=str(screenshot_path), full_page=True)
+    return screenshot_path
+
+
+def run_browser_smoke_test(proxy: Optional[str], user_agent: str, query: Optional[str]) -> None:
+    """Open a neutral page in Chromium through Playwright and optionally save a query screenshot."""
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(
+            "Playwright is required for --smoke_test. Install it with 'python -m pip install playwright'."
+        ) from exc
+
+    browser_binary_path = _get_browser_binary_path()
+    proxy_config = _build_playwright_proxy(proxy)
+    target_url = _build_smoke_test_target(query)
+
+    logger.info(f"Starting browser smoke test with {target_url}")
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path=browser_binary_path,
+            headless=True,
+            proxy=proxy_config if not query else None,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        try:
+            if query:
+                response = requests.get(
+                    target_url,
+                    proxies=_build_requests_proxies(proxy),
+                    headers={"User-Agent": user_agent},
+                    timeout=30,
+                )
+                page = browser.new_page(viewport={"width": 1440, "height": 2200})
+                page.set_content(response.text, wait_until="domcontentloaded")
+                logger.info(
+                    f"Smoke test query response: status={response.status_code} final_url={response.url}"
+                )
+                screenshot_path = _save_smoke_test_screenshot(page, query)
+                logger.info(f"Smoke test screenshot saved: {screenshot_path}")
+            else:
+                page = browser.new_page(user_agent=user_agent)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                sleep(1 * config.behavior.wait_factor)
+
+                page_text = (page.text_content("body") or "").strip()
+
+                logger.info(f"Smoke test page loaded: {page.url}")
+
+                if page_text:
+                    logger.info(f"Smoke test exit IP: {page_text}")
+                else:
+                    logger.info("Smoke test loaded, but the page body was empty.")
+
+            if proxy:
+                logger.debug(f"Smoke test used proxy: {proxy}")
+        finally:
+            browser.close()
+
+
+def main():
+    """Entry point for the tool"""
+
+    arg_parser = get_arg_parser()
+    args = arg_parser.parse_args()
+
+    if args.report_clicks:
+        report_date = datetime.now().strftime("%d-%m-%Y") if not args.date else args.date
+
+        clicklogs_db_client = ClickLogsDB()
+        click_results = clicklogs_db_client.query_clicks(click_date=report_date)
+
+        border = (
+            "+" + "-" * 70 + "+" + "-" * 27 + "+" + "-" * 9 + "+" + "-" * 12 + "+" + "-" * 12 + "+"
+        )
+
+        if click_results:
+            print(border)
+            print(
+                f"| {'URL':68s} | {'Query':25s} | {'Clicks':7s} | {'Time':10s} | {'Category':10s} |"
+            )
+            print(border)
+
+            for result in click_results:
+                url, clicks, category, click_time, search_query = result
+
+                if len(url) > 68:
+                    url = url[:65] + "..."
+
+                print(
+                    f"| {url:68s} | {search_query:25s} | {str(clicks):7s} | {click_time:10s} | {category:10s} |"
+                )
+
+                print(border)
+
+            # write results to Excel with name click_report_dd-mm-yyyy.xlsx
+            if args.excel:
+                generate_click_report(click_results, report_date)
+
+        else:
+            logger.info(f"No click result was found for {report_date}!")
+
+        return
+
+    if args.enable_telegram:
+        if config.behavior.telegram_enabled:
+            start_bot()
+            return
+        else:
+            logger.info("Please set the telegram_enabled option to true in config and try again.")
+            return
+
+    if args.id:
+        update_log_formats(args.id)
+
+    if args.proxy:
+        proxy = args.proxy
+    elif config.paths.proxy_file:
+        proxies = get_proxies()
+        logger.debug(f"Proxies: {proxies}")
+        proxy = random.choice(proxies)
+    elif config.webdriver.proxy:
+        proxy = config.webdriver.proxy
+    else:
+        proxy = None
+
+    query = args.query.strip() if args.query else None
+    domains = []
+
+    if not args.smoke_test:
+        if not query:
+            if not config.behavior.query:
+                logger.error("Fill the query parameter!")
+                raise SystemExit()
+
+            query = config.behavior.query
+
+        domains = get_domains()
+
+    user_agent = get_random_user_agent_string()
+
+    plugin_folder_name = "".join(random.choices(string.ascii_lowercase, k=5))
+    driver = None
+    country_code = None
+    search_controller = None
+
+    try:
+        if args.smoke_test:
+            run_browser_smoke_test(proxy, user_agent, query)
+            return
+
+        driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+
+        if args.check_stealth:
+            from webdriver import execute_stealth_js_code
+
+            execute_stealth_js_code(driver)
+
+            driver.get("https://bot.sannysoft.com/")
+            sleep(5)
+            driver.get("https://browserleaks.com/canvas")
+            sleep(10)
+            driver.get("https://www.browserscan.net/")
+            sleep(15)
+            driver.get("https://pixelscan.net/bot-check")
+            sleep(30)
+            return
+
+        if config.behavior.hooks_enabled:
+            hooks.before_search_hook(driver)
+
+        search_controller = SearchController(driver, query, country_code)
+
+        if args.id:
+            search_controller.set_browser_id(args.id)
+
+        if args.device_id:
+            search_controller.assign_android_device(args.device_id)
+
+        ads, non_ad_links, shopping_ads = search_controller.search_for_ads(non_ad_domains=domains)
+
+        if config.behavior.hooks_enabled:
+            hooks.after_search_hook(driver)
+
+        if not (ads or shopping_ads):
+            logger.info("No ads found in the search results!")
+
+            if config.behavior.telegram_enabled:
+                notify_matching_ads(query, links=None, stats=search_controller.stats)
+        else:
+            logger.debug(f"Selected click order: {config.behavior.click_order}")
+
+            if config.behavior.click_order == 1:
+                all_links = non_ad_links + ads
+
+            elif config.behavior.click_order == 2:
+                all_links = ads + non_ad_links
+
+            elif config.behavior.click_order == 3:
+                if non_ad_links:
+                    all_links = [non_ad_links[0]] + [ads[0]] + non_ad_links[1:] + ads[1:]
+                else:
+                    logger.debug("Couldn't found non-ads! Continue with ads only.")
+                    all_links = ads
+
+            elif config.behavior.click_order == 4:
+                all_links = list(
+                    filterfalse(
+                        lambda x: not x, chain.from_iterable(zip_longest(non_ad_links, ads))
+                    )
+                )
+
+            else:
+                all_links = ads + non_ad_links
+                random.shuffle(all_links)
+
+            logger.info(f"Found {len(ads) + len(shopping_ads)} ads")
+
+            search_controller.click_shopping_ads(shopping_ads)
+            search_controller.click_links(all_links)
+
+            if config.behavior.hooks_enabled:
+                hooks.after_clicks_hook(driver)
+
+            if config.behavior.telegram_enabled:
+                notify_matching_ads(query, links=ads + shopping_ads, stats=search_controller.stats)
+
+            logger.info(search_controller.stats)
+
+    except Exception as exp:
+        logger.error("Exception occurred. See the details in the log file.")
+
+        if driver and config.webdriver.ss_on_exception:
+            take_screenshot(driver)
+
+        message = str(exp).split("\n")[0]
+        logger.debug(f"Exception: {message}")
+        details = traceback.format_tb(exp.__traceback__)
+        logger.debug(f"Exception details: \n{''.join(details)}")
+
+        logger.debug(f"Exception cause: {exp.__cause__}") if exp.__cause__ else None
+
+        if config.behavior.hooks_enabled:
+            hooks.exception_hook(driver)
+
+    finally:
+        if search_controller:
+            if config.behavior.hooks_enabled:
+                hooks.before_browser_close_hook(driver)
+
+            search_controller.end_search()
+
+            if config.behavior.hooks_enabled:
+                hooks.after_browser_close_hook(driver)
+        elif driver:
+            driver.quit()
+
+        if proxy and config.webdriver.auth:
+            plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
+            logger.debug(f"Removing '{plugin_folder}' folder...")
+            shutil.rmtree(plugin_folder, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
