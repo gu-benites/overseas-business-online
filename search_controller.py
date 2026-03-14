@@ -1254,56 +1254,78 @@ class SearchController:
                     logger.info(self.stats)
                     raise SystemExit()
 
-                cookies = ";".join(
-                    [f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()]
-                )
+                max_captcha_attempts = 2
+                for attempt_index in range(max_captcha_attempts):
+                    if attempt_index > 0:
+                        logger.info(
+                            "Retrying captcha in the same browser session with a refreshed page."
+                        )
+                        self._save_step_screenshot(f"captcha_retry_refresh_{attempt_index:02d}")
+                        self._driver.refresh()
+                        sleep(get_random_sleep(3, 4) * config.behavior.wait_factor)
+                        captcha = self._driver.find_element(*self.RECAPTCHA)
 
-                logger.debug(f"Cookies: {cookies}")
+                    cookies = ";".join(
+                        [f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()]
+                    )
+                    browser_user_agent = self._driver.execute_script("return navigator.userAgent")
 
-                sitekey = captcha.get_attribute("data-sitekey")
-                data_s = captcha.get_attribute("data-s")
+                    logger.debug(f"Cookies: {cookies}")
 
-                logger.debug(f"data-sitekey: {sitekey}, data-s: {data_s}")
-                logger.info(
-                    "Captcha fingerprint: "
-                    f"url={self._driver.current_url}, "
-                    f"sitekey={sitekey}, "
-                    f"has_data_s={bool(data_s)}, "
-                    f"cookie_count={len(self._driver.get_cookies())}, "
-                    f"has_proxy={bool(getattr(self._driver, '_active_proxy', None))}, "
-                    f"proxy={getattr(self._driver, '_active_proxy', None)}"
-                )
-                self._save_step_screenshot("captcha_before_solve")
+                    sitekey = captcha.get_attribute("data-sitekey")
+                    data_s = captcha.get_attribute("data-s")
 
-                response_code = solve_recaptcha(
-                    apikey=self._twocaptcha_apikey,
-                    sitekey=sitekey,
-                    current_url=self._driver.current_url,
-                    data_s=data_s,
-                    cookies=cookies,
-                    poll_hook=self._on_captcha_poll,
-                    proxy=getattr(self._driver, "_active_proxy", None),
-                )
+                    logger.debug(f"data-sitekey: {sitekey}, data-s: {data_s}")
+                    logger.info(
+                        "Captcha fingerprint: "
+                        f"attempt={attempt_index + 1}/{max_captcha_attempts}, "
+                        f"url={self._driver.current_url}, "
+                        f"sitekey={sitekey}, "
+                        f"has_data_s={bool(data_s)}, "
+                        f"cookie_count={len(self._driver.get_cookies())}, "
+                        f"has_proxy={bool(getattr(self._driver, '_active_proxy', None))}, "
+                        f"proxy={getattr(self._driver, '_active_proxy', None)}, "
+                        f"user_agent={browser_user_agent}"
+                    )
+                    self._save_step_screenshot(
+                        f"captcha_before_solve_attempt_{attempt_index + 1:02d}"
+                    )
 
-                if response_code:
-                    logger.info("2captcha returned a captcha token.")
-                    self._stats.captcha_token_received = True
+                    response_code = solve_recaptcha(
+                        apikey=self._twocaptcha_apikey,
+                        sitekey=sitekey,
+                        current_url=self._driver.current_url,
+                        data_s=data_s,
+                        cookies=cookies,
+                        poll_hook=self._on_captcha_poll,
+                        proxy=getattr(self._driver, "_active_proxy", None),
+                        user_agent=browser_user_agent,
+                    )
 
-                    self._apply_captcha_solution(response_code)
-                    self._stats.captcha_token_applied = True
-                    logger.info("Captcha token was applied to the page.")
+                    if response_code:
+                        logger.info("2captcha returned a captcha token.")
+                        self._stats.captcha_token_received = True
 
-                    sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
-                    self._save_step_screenshot("captcha_after_solve")
-                    self._mark_captcha_outcome()
-                    self._abort_if_google_blocked("post_captcha")
+                        self._apply_captcha_solution(response_code)
+                        self._stats.captcha_token_applied = True
+                        logger.info("Captcha token was applied to the page.")
 
-                else:
+                        sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+                        self._save_step_screenshot("captcha_after_solve")
+                        self._mark_captcha_outcome()
+                        self._abort_if_google_blocked("post_captcha")
+                        break
+
+                    if attempt_index + 1 < max_captcha_attempts:
+                        logger.info(
+                            "No captcha token was obtained. Refreshing for one soft retry "
+                            "to fetch a fresh Google challenge."
+                        )
+                        continue
+
                     logger.info("No captcha token could be obtained. Please try with a different proxy.")
                     self._save_step_screenshot("captcha_unsolved")
-
                     self._driver.quit()
-
                     raise SystemExit()
 
         except NoSuchElementException:

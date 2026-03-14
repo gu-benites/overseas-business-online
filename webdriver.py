@@ -166,7 +166,6 @@ def _get_browser_binary_path() -> str:
     )
 
 
-
 class CustomChrome(undetected_chromedriver.Chrome):
     """Modified Chrome implementation"""
 
@@ -378,7 +377,6 @@ def create_webdriver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
-
         if config.webdriver.language_from_proxy:
             lang = get_locale_language(country_code)
             chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})

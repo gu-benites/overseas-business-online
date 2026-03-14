@@ -2,6 +2,7 @@ import json
 import platform
 import random
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
@@ -375,6 +376,7 @@ def solve_recaptcha(
     cookies: Optional[str] = None,
     poll_hook: Optional[Callable[[str, int], None]] = None,
     proxy: Optional[str] = None,
+    user_agent: Optional[str] = None,
 ) -> Optional[str]:
     """Solve the recaptcha using the 2captcha service
 
@@ -395,7 +397,8 @@ def solve_recaptcha(
     logger.info("Trying to solve captcha...")
     logger.debug(
         "2captcha target details: "
-        f"url={current_url}, sitekey={sitekey}, has_data_s={bool(data_s)}, has_cookies={bool(cookies)}"
+        f"url={current_url}, sitekey={sitekey}, has_data_s={bool(data_s)}, "
+        f"has_cookies={bool(cookies)}, has_user_agent={bool(user_agent)}"
     )
 
     create_task_url = "https://api.2captcha.com/createTask"
@@ -404,15 +407,20 @@ def solve_recaptcha(
     max_retry_count = 13
     create_retry_count = 0
     request_timeout = 30
+    max_poll_seconds = max(180, int(180 * config.behavior.wait_factor))
+    poll_interval_seconds = max(5, int(5 * config.behavior.wait_factor))
     task_id = None
 
     base_task: dict[str, Any] = {"websiteURL": current_url, "websiteKey": sitekey}
     if data_s:
         base_task["recaptchaDataSValue"] = data_s
+        base_task["enterprisePayload"] = {"s": data_s}
     if cookies:
         normalized_cookies = _normalize_2captcha_cookies(cookies)
         if normalized_cookies:
             base_task["cookies"] = normalized_cookies
+    if user_agent:
+        base_task["userAgent"] = user_agent
 
     def _parse_proxy(proxy_value: str) -> Optional[dict[str, Any]]:
         if not proxy_value:
@@ -444,6 +452,10 @@ def solve_recaptcha(
     attempts: list[tuple[str, dict[str, Any]]] = []
     proxy_cfg = _parse_proxy(proxy or "")
     if proxy_cfg:
+        task_v2_enterprise_proxy = dict(base_task)
+        task_v2_enterprise_proxy.update({"type": "RecaptchaV2EnterpriseTask", **proxy_cfg})
+        attempts.append(("v2_enterprise_with_proxy", task_v2_enterprise_proxy))
+
         task_v2_proxy = dict(base_task)
         task_v2_proxy.update({"type": "RecaptchaV2Task", **proxy_cfg})
         attempts.append(("v2_with_proxy", task_v2_proxy))
@@ -496,7 +508,8 @@ def solve_recaptcha(
         sleep(15 * config.behavior.wait_factor)
         poll_payload = {"clientKey": apikey, "taskId": task_id}
         poll_retry_count = 0
-        while poll_retry_count < max_retry_count:
+        poll_deadline = time.monotonic() + max_poll_seconds
+        while poll_retry_count < max_retry_count and time.monotonic() < poll_deadline:
             try:
                 response = requests.post(
                     get_task_result_url, json=poll_payload, timeout=request_timeout
@@ -525,7 +538,7 @@ def solve_recaptcha(
                 poll_retry_count += 1
                 continue
             if poll_status == "processing":
-                wait_time = 5 * config.behavior.wait_factor
+                wait_time = poll_interval_seconds
                 logger.info(f"Waiting {wait_time} seconds before checking response again...")
                 sleep(wait_time)
                 poll_retry_count += 1
@@ -536,6 +549,10 @@ def solve_recaptcha(
                 return str(token) if token else None
             poll_retry_count += 1
             sleep(5 * config.behavior.wait_factor)
+        logger.warning(
+            f"2captcha task timed out while still processing ({task_label}) "
+            f"after about {max_poll_seconds} seconds."
+        )
         return None
 
     for label, task in attempts:
