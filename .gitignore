@@ -142,6 +142,9 @@ proxy_auth_plugin/
 downloaded_files/
 .streamlit_uploads/
 .streamlit_logs/
+.run_screenshots/
+artifacts/screenshots/
+google-page.png
 
 .MULTI_BROWSERS_IN_USE
 .TELEGRAM_CHAT_ID

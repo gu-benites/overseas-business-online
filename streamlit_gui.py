@@ -24,7 +24,6 @@ ROOT = Path.cwd()
 load_dotenv(ROOT / ".env")
 CONFIG_PATH = ROOT / "config.json"
 LOG_DIR = ROOT / ".streamlit_logs"
-SMOKE_TEST_SCREENSHOT_DIR = ROOT / ".streamlit_uploads" / "smoke_test_screenshots"
 
 
 REQUIRED_FIELDS = {
@@ -130,9 +129,9 @@ def start_process(script: str, extra_args: list[str] | None = None, process_key:
         args.extend(extra_args)
 
     if os.name == "posix" and not os.environ.get("DISPLAY"):
-        xvfb_run = shutil.which("xvfb-run")
-        if xvfb_run:
-            args = [xvfb_run, "-a", *args]
+        # The VPS has XRDP running on Display :10 – prefer that for headful
+        # Chromium.  Fall back to xvfb-run only if absolutely necessary.
+        os.environ["DISPLAY"] = ":10"
 
     log_path = LOG_DIR / f"{key}.log"
     try:
@@ -191,18 +190,6 @@ def read_recent_lines(log_file: Path, limit: int = 30) -> str:
         return ""
 
     return "\n".join(lines[-limit:])
-
-
-def get_smoke_test_screenshots(limit: int = 10) -> list[Path]:
-    if not SMOKE_TEST_SCREENSHOT_DIR.exists():
-        return []
-
-    screenshots = sorted(
-        SMOKE_TEST_SCREENSHOT_DIR.glob("*.png"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    return screenshots[:limit]
 
 
 def to_int(raw: Any, fallback: int) -> int:
@@ -554,12 +541,7 @@ if generated_payload:
                 st.error(f"Failed to write query_file: {exc}")
 
 st.subheader("Actions")
-smoke_test_query = st.text_input(
-    "Smoke test query",
-    value="desentupidora porto alegre zn",
-    help="Optional. Runs a safe Google search smoke test and saves a screenshot when filled.",
-)
-action_1, action_2, action_3, action_4, action_5 = st.columns(5)
+action_1, action_2, action_3, action_4 = st.columns(4)
 with action_1:
     if st.button("RUN ad_clicker.py"):
         start_process("ad_clicker.py")
@@ -576,33 +558,6 @@ with action_4:
     if st.button("GENERATE CLICK REPORT"):
         start_process("ad_clicker.py", ["--report_clicks", "--excel"], process_key="report_clicks")
 
-with action_5:
-    if st.button("RUN smoke test"):
-        smoke_args = ["--smoke_test"]
-        current_smoke_query = smoke_test_query.strip()
-        if current_smoke_query:
-            smoke_args.extend(["--query", current_smoke_query])
-        start_process("ad_clicker.py", smoke_args, process_key="smoke_test")
-
-
-st.subheader("Smoke Test Screenshots")
-screenshots = get_smoke_test_screenshots()
-if screenshots and "selected_smoke_screenshot" not in st.session_state:
-    st.session_state["selected_smoke_screenshot"] = str(screenshots[0])
-
-if screenshots:
-    list_col, preview_col = st.columns([1, 2])
-    with list_col:
-        for screenshot in screenshots:
-            if st.button(screenshot.name, key=f"open_{screenshot.name}"):
-                st.session_state["selected_smoke_screenshot"] = str(screenshot)
-    with preview_col:
-        selected_screenshot = Path(st.session_state["selected_smoke_screenshot"])
-        if selected_screenshot.exists():
-            st.image(str(selected_screenshot), caption=selected_screenshot.name, width="stretch")
-else:
-    st.info("No smoke test screenshots yet. Run a smoke test query to generate one.")
-
 
 st.subheader("Running jobs")
 tracked_processes = [
@@ -610,14 +565,11 @@ tracked_processes = [
     ("run_ad_clicker.py", "run_ad_clicker.py"),
     ("run_in_loop.py", "run_in_loop.py"),
     ("ad_clicker.py", "generate click report"),
-    ("ad_clicker.py", "smoke test"),
 ]
 
 for script, label in tracked_processes:
     if label == "generate click report":
         key = "report_clicks"
-    elif label == "smoke test":
-        key = "smoke_test"
     else:
         key = Path(script).stem
     with st.container():

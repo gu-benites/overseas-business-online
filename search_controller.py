@@ -1,7 +1,10 @@
 import sys
 import json
 import random
+import urllib.parse
 from datetime import datetime
+from pathlib import Path
+import re
 from time import sleep
 from threading import Thread
 from typing import Any, Optional, Union
@@ -16,6 +19,7 @@ from selenium.common.exceptions import (
     JavascriptException,
     TimeoutException,
     NoSuchElementException,
+    WebDriverException,
     ElementNotInteractableException,
     ElementClickInterceptedException,
     StaleElementReferenceException,
@@ -68,6 +72,17 @@ class SearchController:
     CAPTCHA_DIALOG = (By.CSS_SELECTOR, "div[aria-label^='Captcha-Dialog']")
     CAPTCHA_IFRAME = (By.CSS_SELECTOR, "iframe[title='Captcha']")
     RECAPTCHA = (By.ID, "recaptcha")
+    BLOCK_PAGE_MARKERS = (
+        "Our systems have detected unusual traffic",
+        "Please try your request again later.",
+    )
+    RESULTS_READY_SELECTORS = (
+        (By.ID, "appbar"),
+        (By.ID, "search"),
+        (By.ID, "rso"),
+        (By.ID, "tads"),
+        (By.ID, "center_col"),
+    )
     ESTIMATED_LOC_IMG = (
         By.CSS_SELECTOR,
         "img[src^='https://ssl.gstatic.com/oolong/preprompt/Estimated']",
@@ -95,6 +110,11 @@ class SearchController:
         self._android_device_id = None
 
         self._stats = SearchStats()
+        query_slug = re.sub(r"[^a-z0-9]+", "-", self._search_query.lower()).strip("-") or "query"
+        self._run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{query_slug[:40]}"
+        self._screenshot_root = Path.cwd() / ".run_screenshots" / self._run_id
+        self._screenshot_root.mkdir(parents=True, exist_ok=True)
+        self._screenshot_counter = 0
 
         if config.behavior.excludes:
             self._exclude_list = [item.strip() for item in config.behavior.excludes.split(",")]
@@ -127,8 +147,16 @@ class SearchController:
             for cookie in self._driver.get_cookies():
                 logger.debug(cookie)
 
-        self._check_captcha()
+        self._wait_for_page_settle()
+        self._ensure_browser_session_alive("after_initial_settle")
+        self._save_step_screenshot("after_query_sent")
+        self._ensure_browser_session_alive("after_initial_screenshot")
         self._close_cookie_dialog()
+        self._ensure_browser_session_alive("after_cookie_dialog")
+        self._wait_for_page_settle()
+        self._ensure_browser_session_alive("after_second_settle")
+        self._check_captcha()
+        self._abort_if_google_blocked("search_start")
 
         logger.info(f"Starting search for '{self._search_query}'")
         sleep(get_random_sleep(1, 2) * config.behavior.wait_factor)
@@ -157,27 +185,30 @@ class SearchController:
                         pass
 
             except TimeoutException:
-                logger.error("Timed out waiting for search box!")
-                self.end_search()
-
-                return (None, None, None)
+                logger.error("Timed out waiting for search box! Falling back to direct search URL.")
+                self._open_search_results_directly()
+        except NoSuchElementException:
+            self._abort_if_google_blocked("search_input_missing")
+            logger.warning("Search input was not found. Falling back to direct search URL.")
+            self._open_search_results_directly()
 
         self._check_captcha()
+        self._abort_if_google_blocked("after_query_submit")
 
         # wait 2 to 3 seconds before checking if results were loaded
         sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
 
-        if not self._driver.find_elements(*self.RESULTS_CONTAINER):
+        if not self._results_page_ready():
             self._close_cookie_dialog()
 
-            search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-            if not search_input_box.get_attribute("value"):
-                logger.debug(f"Reentering search query '{self._search_query}'")
-                self._type_humanlike(search_input_box, self._search_query)
-
-                # sleep after entering search keyword by randomly selected amount
-                # between 2 to 3 seconds
-                sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
+            try:
+                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
+                if not search_input_box.get_attribute("value"):
+                    logger.debug(f"Reentering search query '{self._search_query}'")
+                    self._type_humanlike(search_input_box, self._search_query)
+                    sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
+            except NoSuchElementException:
+                logger.debug("Search input is not available after direct search fallback.")
 
         if self._hooks_enabled:
             hooks.after_query_sent_hook(self._driver, self._search_query)
@@ -188,16 +219,15 @@ class SearchController:
 
         try:
             wait = WebDriverWait(self._driver, timeout=5)
-            results_loaded = wait.until(EC.presence_of_element_located(self.RESULTS_CONTAINER))
+            results_loaded = wait.until(lambda driver: self._results_page_ready())
 
             if results_loaded:
                 if self._hooks_enabled:
                     hooks.results_ready_hook(self._driver)
 
+                self._save_step_screenshot("results_loaded")
                 self._close_choose_location_popup()
-
-                self._make_random_scrolls()
-                self._make_random_mouse_movements()
+                logger.debug("Skipping random scroll and mouse interactions for browser stability.")
 
                 self._close_choose_location_popup()
 
@@ -229,6 +259,7 @@ class SearchController:
                 ad_link = ad[1]
                 ad_title = ad[2].replace("\n", " ")
                 logger.info(f"Clicking to [{ad_title}]({ad_link})...")
+                self._save_step_screenshot("shopping_before_click")
 
                 if self._hooks_enabled:
                     hooks.before_ad_click_hook(self._driver)
@@ -239,6 +270,7 @@ class SearchController:
                     self._handle_browser_click(
                         ad_link_element, ad_link, True, original_window_handle, category="Shopping"
                     )
+                self._save_step_screenshot("shopping_after_click")
 
             except Exception:
                 logger.debug(f"Failed to click ad element [{ad_title}]!")
@@ -267,6 +299,8 @@ class SearchController:
                 logger.info(
                     f"Clicking to {'[' + ad_title + '](' + link_url + ')' if is_ad_element else '[' + link_url + ']'}..."
                 )
+                category = "ad" if is_ad_element else "non_ad"
+                self._save_step_screenshot(f"{category}_before_click")
 
                 category = "Ad" if is_ad_element else "Non-ad"
 
@@ -276,6 +310,9 @@ class SearchController:
                     self._handle_browser_click(
                         link_element, link_url, is_ad_element, original_window_handle, category
                     )
+                self._save_step_screenshot(
+                    f"{'ad' if is_ad_element else 'non_ad'}_after_click"
+                )
 
                 # scroll the page to avoid elements remain outside of the view
                 self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
@@ -288,6 +325,40 @@ class SearchController:
 
             except Exception:
                 logger.error(f"Failed to click on [{ad_title if is_ad_element else link_url}]!")
+
+    def _save_step_screenshot(self, step_name: str) -> None:
+        """Save flow screenshots for debugging before/after click steps."""
+
+        if not self._driver:
+            return
+
+        try:
+            self._screenshot_counter += 1
+            safe_step_name = re.sub(r"[^a-zA-Z0-9_\\-]+", "_", step_name).strip("_") or "step"
+            browser_label = (
+                f"browser_{self._stats.browser_id}" if self._stats.browser_id is not None else "browser_single"
+            )
+            target_dir = self._screenshot_root / browser_label
+            target_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{self._screenshot_counter:04d}_{safe_step_name}.png"
+            screenshot_path = target_dir / filename
+            self._driver.save_screenshot(str(screenshot_path))
+            logger.debug(f"Saved run screenshot: {screenshot_path}")
+        except Exception as exp:
+            logger.debug(f"Failed to save step screenshot ({step_name}): {exp}")
+
+    def _on_captcha_poll(self, response_text: str, retry_count: int) -> None:
+        """Capture captcha page state while polling 2captcha results."""
+
+        normalized = response_text.strip().lower()
+        if normalized.startswith("ok|"):
+            status = "ok"
+        elif "not_ready" in normalized:
+            status = "not_ready"
+        else:
+            status = normalized.replace("|", "_").replace(" ", "_")[:40] or "unknown"
+
+        self._save_step_screenshot(f"captcha_poll_{retry_count:02d}_{status}")
 
     def _extract_link_info(self, link: Any, is_ad_element: bool) -> tuple:
         """Extract link information
@@ -405,6 +476,7 @@ class SearchController:
             if window_handle != original_window_handle:
                 self._driver.switch_to.window(window_handle)
                 click_time = datetime.now().strftime("%H:%M:%S")
+                self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
 
                 sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
                 logger.debug(f"Current url on new tab: {self._driver.current_url}")
@@ -428,6 +500,7 @@ class SearchController:
                 wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
                 logger.debug(f"Waiting {wait_time} seconds on {category.lower()} page...")
                 sleep(wait_time)
+                self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_before_close")
 
                 self._driver.close()
                 break
@@ -841,11 +914,21 @@ class SearchController:
 
         sleep(get_random_sleep(3, 3.5) * config.behavior.wait_factor)
 
-        all_links = [
-            element.get_attribute("href")
-            for element in self._driver.find_elements(By.TAG_NAME, "a")
-            if isinstance(element.get_attribute("href"), str)
-        ]
+        try:
+            all_links = [
+                element.get_attribute("href")
+                for element in self._driver.find_elements(By.TAG_NAME, "a")
+                if isinstance(element.get_attribute("href"), str)
+            ]
+        except WebDriverException as exp:
+            exp_text = str(exp).lower()
+            if "invalid session id" in exp_text or "tab crashed" in exp_text or "disconnected" in exp_text:
+                logger.error(
+                    "Browser session became unavailable while checking cookie dialog. "
+                    "Stopping this run cleanly."
+                )
+                raise SystemExit()
+            raise
 
         for link in all_links:
             if "policies.google.com" in link:
@@ -921,6 +1004,59 @@ class SearchController:
             if "not connected to DevTools" in str(exp):
                 logger.debug("Incognito mode is active. No need to delete cache. Skipping...")
 
+    def _results_page_ready(self) -> bool:
+        for selector in self.RESULTS_READY_SELECTORS:
+            try:
+                if self._driver.find_elements(*selector):
+                    return True
+            except Exception:
+                return False
+
+        current_url = (self._driver.current_url or "").lower()
+        return "/search?" in current_url or "&q=" in current_url
+
+    def _open_search_results_directly(self) -> None:
+        """Fallback to direct Google search URL when homepage input is unavailable."""
+
+        query_param = urllib.parse.quote_plus(self._search_query)
+        search_url = f"{self.URL}/search?q={query_param}"
+        logger.info(f"Opening direct search URL: {search_url}")
+        self._driver.get(search_url)
+        self._wait_for_page_settle()
+
+    def _ensure_browser_session_alive(self, stage: str) -> None:
+        try:
+            self._driver.execute_script("return document.readyState")
+        except Exception as exp:
+            exp_text = str(exp).lower()
+            if "invalid session id" in exp_text or "tab crashed" in exp_text or "disconnected" in exp_text:
+                logger.error(
+                    f"Browser session became unavailable during {stage}. "
+                    "Stopping this run cleanly."
+                )
+                try:
+                    self._save_step_screenshot(f"{stage}_browser_unavailable")
+                except Exception:
+                    pass
+                try:
+                    self._driver.quit()
+                except Exception:
+                    pass
+                raise SystemExit()
+            raise
+
+    def _wait_for_page_settle(self, timeout: int = 8) -> None:
+        """Give Google a chance to finish first paint/load before probing the page."""
+
+        try:
+            WebDriverWait(self._driver, timeout=timeout).until(
+                lambda driver: driver.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            logger.debug("Page settle wait timed out. Continuing with best-effort state.")
+
+        sleep(get_random_sleep(1.2, 2.2) * config.behavior.wait_factor)
+
     def _set_start_url(self, country_code: str) -> None:
         """Set start url according to country code of the proxy IP
 
@@ -949,14 +1085,23 @@ class SearchController:
         logger.debug(f"Direction choices: {[d.value for d in directions]}")
 
         for direction in directions:
-            if direction == Direction.DOWN and not self._is_scroll_at_the_end():
-                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
-            elif direction == Direction.UP:
-                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_UP)
+            try:
+                if direction == Direction.DOWN and not self._is_scroll_at_the_end():
+                    scroll_y = random.choice(range(500, 900))
+                    self._driver.execute_script("window.scrollBy(0, arguments[0]);", scroll_y)
+                elif direction == Direction.UP:
+                    scroll_y = -random.choice(range(350, 700))
+                    self._driver.execute_script("window.scrollBy(0, arguments[0]);", scroll_y)
+            except Exception as exp:
+                logger.debug(f"Skipping random scroll step due to browser instability: {exp}")
+                return
 
             sleep(get_random_sleep(1, 3) * config.behavior.wait_factor)
 
-        self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
+        try:
+            self._driver.execute_script("window.scrollTo(0, 0);")
+        except Exception as exp:
+            logger.debug(f"Skipping final scroll-to-top due to browser instability: {exp}")
 
     def _make_random_swipes(self) -> None:
         """Make random swipes on page"""
@@ -1085,12 +1230,19 @@ class SearchController:
         """Check if captcha exists and solve it if 2captcha is used, otherwise exit"""
 
         sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+        try:
+            WebDriverWait(self._driver, timeout=5).until(
+                lambda driver: driver.execute_script("return document.readyState") in ("interactive", "complete")
+            )
+        except Exception:
+            logger.debug("Page readiness check timed out before captcha probe.")
 
         try:
             captcha = self._driver.find_element(*self.RECAPTCHA)
 
             if captcha:
                 logger.error("Captcha was shown.")
+                self._save_step_screenshot("captcha_seen")
 
                 if self._hooks_enabled:
                     hooks.captcha_seen_hook(self._driver)
@@ -1112,6 +1264,16 @@ class SearchController:
                 data_s = captcha.get_attribute("data-s")
 
                 logger.debug(f"data-sitekey: {sitekey}, data-s: {data_s}")
+                logger.info(
+                    "Captcha fingerprint: "
+                    f"url={self._driver.current_url}, "
+                    f"sitekey={sitekey}, "
+                    f"has_data_s={bool(data_s)}, "
+                    f"cookie_count={len(self._driver.get_cookies())}, "
+                    f"has_proxy={bool(getattr(self._driver, '_active_proxy', None))}, "
+                    f"proxy={getattr(self._driver, '_active_proxy', None)}"
+                )
+                self._save_step_screenshot("captcha_before_solve")
 
                 response_code = solve_recaptcha(
                     apikey=self._twocaptcha_apikey,
@@ -1119,22 +1281,26 @@ class SearchController:
                     current_url=self._driver.current_url,
                     data_s=data_s,
                     cookies=cookies,
+                    poll_hook=self._on_captcha_poll,
+                    proxy=getattr(self._driver, "_active_proxy", None),
                 )
 
                 if response_code:
-                    logger.info("Captcha was solved.")
+                    logger.info("2captcha returned a captcha token.")
+                    self._stats.captcha_token_received = True
 
-                    self._stats.captcha_solved = True
-
-                    captcha_redirect_url = (
-                        f"{self._driver.current_url}&g-recaptcha-response={response_code}"
-                    )
-                    self._driver.get(captcha_redirect_url)
+                    self._apply_captcha_solution(response_code)
+                    self._stats.captcha_token_applied = True
+                    logger.info("Captcha token was applied to the page.")
 
                     sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+                    self._save_step_screenshot("captcha_after_solve")
+                    self._mark_captcha_outcome()
+                    self._abort_if_google_blocked("post_captcha")
 
                 else:
-                    logger.info("Please try with a different proxy.")
+                    logger.info("No captcha token could be obtained. Please try with a different proxy.")
+                    self._save_step_screenshot("captcha_unsolved")
 
                     self._driver.quit()
 
@@ -1142,6 +1308,183 @@ class SearchController:
 
         except NoSuchElementException:
             logger.debug("No captcha seen. Continue to search...")
+        except WebDriverException as exp:
+            exp_text = str(exp).lower()
+            if "tab crashed" in exp_text or "invalid session id" in exp_text:
+                logger.error(
+                    "Browser became unstable while checking captcha presence. "
+                    "Stopping this run cleanly."
+                )
+                try:
+                    self._save_step_screenshot("captcha_check_browser_crashed")
+                except Exception:
+                    pass
+                self._driver.quit()
+                raise SystemExit()
+            raise
+
+    def _is_google_block_page(self) -> bool:
+        page_text = (self._driver.page_source or "").lower()
+        return all(marker.lower() in page_text for marker in self.BLOCK_PAGE_MARKERS)
+
+    def _abort_if_google_blocked(self, stage: str) -> None:
+        if not self._is_google_block_page():
+            return
+
+        self._stats.google_blocked_after_captcha = True
+        self._save_step_screenshot(f"{stage}_google_blocked")
+        logger.error(
+            "Google is still blocking this session after captcha handling. "
+            "The proxy/session reputation is being rejected."
+        )
+        logger.info("Please try with a different proxy.")
+        self._driver.quit()
+        raise SystemExit()
+
+    def _mark_captcha_outcome(self) -> None:
+        if self._is_google_block_page():
+            self._stats.google_blocked_after_captcha = True
+            self._stats.captcha_accepted = False
+            logger.warning(
+                "Captcha token was received and applied, but Google still rejected the session."
+            )
+            return
+
+        try:
+            self._driver.find_element(*self.RECAPTCHA)
+            self._stats.captcha_accepted = False
+            logger.warning("Captcha token was applied, but the captcha challenge is still present.")
+        except NoSuchElementException:
+            self._stats.captcha_accepted = True
+            logger.info("Captcha challenge cleared and Google accepted the session.")
+
+    def _apply_captcha_solution(self, response_code: str) -> None:
+        """Inject the 2captcha token into the current page and submit if needed."""
+
+        logger.debug(f"Applying captcha solution on URL: {self._driver.current_url}")
+
+        apply_result = self._driver.execute_script(
+            """
+            const token = arguments[0];
+
+            const details = {
+                textareasUpdated: 0,
+                callbackInvoked: false,
+                formSubmitted: false,
+                submitClicked: false,
+                textareaPresent: false,
+            };
+
+            const selectors = [
+                'textarea[name="g-recaptcha-response"]',
+                'textarea#g-recaptcha-response',
+                'input[name="g-recaptcha-response"]',
+            ];
+
+            let fields = [];
+            for (const selector of selectors) {
+                fields = fields.concat(Array.from(document.querySelectorAll(selector)));
+            }
+
+            if (!fields.length) {
+                const hostForm =
+                    document.querySelector('#recaptcha')?.closest('form') ||
+                    document.querySelector('form');
+                const textarea = document.createElement('textarea');
+                textarea.name = 'g-recaptcha-response';
+                textarea.id = 'g-recaptcha-response';
+                textarea.style.display = 'none';
+                (hostForm || document.body).appendChild(textarea);
+                fields.push(textarea);
+            }
+
+            details.textareaPresent = fields.length > 0;
+
+            for (const field of fields) {
+                field.value = token;
+                field.innerHTML = token;
+                field.dispatchEvent(new Event('input', { bubbles: true }));
+                field.dispatchEvent(new Event('change', { bubbles: true }));
+                details.textareasUpdated += 1;
+            }
+
+            const cfg = window.___grecaptcha_cfg;
+            if (cfg && cfg.clients) {
+                const visit = (node) => {
+                    if (!node || details.callbackInvoked) return;
+                    if (typeof node === 'function') {
+                        try {
+                            node(token);
+                            details.callbackInvoked = true;
+                            return;
+                        } catch (err) {}
+                    }
+                    if (typeof node !== 'object') return;
+                    for (const value of Object.values(node)) {
+                        if (details.callbackInvoked) return;
+                        visit(value);
+                    }
+                };
+                visit(cfg.clients);
+            }
+
+            const form =
+                document.querySelector('#recaptcha')?.closest('form') ||
+                document.querySelector('textarea[name="g-recaptcha-response"]')?.closest('form') ||
+                document.querySelector('form[action*="sorry"]') ||
+                document.querySelector('form');
+
+            if (form && !details.callbackInvoked) {
+                try {
+                    if (typeof form.submit === 'function') {
+                        form.submit();
+                        details.formSubmitted = true;
+                    }
+                } catch (err) {}
+            }
+
+            if (!details.formSubmitted) {
+                const submitButton =
+                    document.querySelector('button[type="submit"]') ||
+                    document.querySelector('input[type="submit"]') ||
+                    document.querySelector('#recaptcha ~ div button');
+
+                if (submitButton) {
+                    try {
+                        submitButton.click();
+                        details.submitClicked = true;
+                    } catch (err) {}
+                }
+            }
+
+            return details;
+            """,
+            response_code,
+        )
+
+        logger.debug(f"Captcha solution apply result: {apply_result}")
+
+        current_url = self._driver.current_url
+        wait = WebDriverWait(self._driver, timeout=12)
+        try:
+            wait.until(lambda driver: "sorry" not in driver.current_url.lower())
+            logger.debug("Captcha page redirect detected after token injection.")
+            return
+        except TimeoutException:
+            logger.debug("Captcha page did not redirect after token injection.")
+
+        try:
+            wait.until_not(EC.presence_of_element_located(self.RECAPTCHA))
+            logger.debug("Captcha element disappeared after token injection.")
+            return
+        except TimeoutException:
+            logger.debug("Captcha element still present after token injection.")
+
+        if "g-recaptcha-response=" not in current_url:
+            joiner = "&" if "?" in current_url else "?"
+            fallback_url = f"{current_url}{joiner}g-recaptcha-response={response_code}"
+            logger.debug("Falling back to URL token append for captcha response.")
+            self._driver.get(fallback_url)
 
     def _close_choose_location_popup(self) -> None:
         """Close 'Choose location for search results' popup"""

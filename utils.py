@@ -8,7 +8,7 @@ from enum import Enum
 from itertools import cycle
 from pathlib import Path
 from time import sleep
-from typing import Optional
+from typing import Any, Callable, Optional
 
 try:
     import requests
@@ -373,6 +373,8 @@ def solve_recaptcha(
     current_url: str,
     data_s: str,
     cookies: Optional[str] = None,
+    poll_hook: Optional[Callable[[str, int], None]] = None,
+    proxy: Optional[str] = None,
 ) -> Optional[str]:
     """Solve the recaptcha using the 2captcha service
 
@@ -391,76 +393,158 @@ def solve_recaptcha(
     """
 
     logger.info("Trying to solve captcha...")
+    logger.debug(
+        "2captcha target details: "
+        f"url={current_url}, sitekey={sitekey}, has_data_s={bool(data_s)}, has_cookies={bool(cookies)}"
+    )
 
-    api_url = "http://2captcha.com/in.php"
-    params = {
-        "key": apikey,
-        "method": "userrecaptcha",
-        "googlekey": sitekey,
-        "pageurl": current_url,
-        "data-s": data_s,
-    }
-
-    if cookies:
-        params["cookies"] = cookies
+    create_task_url = "https://api.2captcha.com/createTask"
+    get_task_result_url = "https://api.2captcha.com/getTaskResult"
 
     max_retry_count = 13
-    request_retry_count = 0
+    create_retry_count = 0
+    request_timeout = 30
+    task_id = None
 
-    while request_retry_count < max_retry_count:
-        response = requests.get(api_url, params=params)
+    base_task: dict[str, Any] = {"websiteURL": current_url, "websiteKey": sitekey}
+    if data_s:
+        base_task["recaptchaDataSValue"] = data_s
+    if cookies:
+        normalized_cookies = _normalize_2captcha_cookies(cookies)
+        if normalized_cookies:
+            base_task["cookies"] = normalized_cookies
 
-        logger.debug(f"Response: {response.text}")
+    def _parse_proxy(proxy_value: str) -> Optional[dict[str, Any]]:
+        if not proxy_value:
+            return None
+        if "@" in proxy_value:
+            creds, host_port = proxy_value.split("@", 1)
+            if ":" not in creds or ":" not in host_port:
+                return None
+            login, password = creds.split(":", 1)
+            host, port = host_port.rsplit(":", 1)
+            if not port.isdigit():
+                return None
+            return {
+                "proxyType": "http",
+                "proxyAddress": host,
+                "proxyPort": int(port),
+                "proxyLogin": login,
+                "proxyPassword": password,
+            }
+        host, port = proxy_value.rsplit(":", 1)
+        if not port.isdigit():
+            return None
+        return {
+            "proxyType": "http",
+            "proxyAddress": host,
+            "proxyPort": int(port),
+        }
 
-        error_to_exit, error_to_continue, error_to_break = _check_error(response.text)
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    proxy_cfg = _parse_proxy(proxy or "")
+    if proxy_cfg:
+        task_v2_proxy = dict(base_task)
+        task_v2_proxy.update({"type": "RecaptchaV2Task", **proxy_cfg})
+        attempts.append(("v2_with_proxy", task_v2_proxy))
 
-        if error_to_exit:
-            raise SystemExit()
-
-        elif error_to_break:
-            request_id = response.text.split("|")[1]
-            logger.debug(f"request_id: {request_id}")
-            break
-
-        elif error_to_continue:
-            request_retry_count += 1
-            continue
-
-    initial_captcha_response_wait = 15
-    sleep(initial_captcha_response_wait * config.behavior.wait_factor)
-
-    # check if the CAPTCHA has been solved
-    response_api_url = "http://2captcha.com/res.php"
-    params = {"key": apikey, "action": "get", "id": request_id}
-
-    response_retry_count = 0
-    captcha_response = None
-
-    while response_retry_count < max_retry_count:
-        response = requests.get(response_api_url, params=params)
-
-        logger.debug(f"Response: {response.text}")
-
-        error_to_exit, error_to_continue, error_to_break = _check_error(
-            response.text, request_type="res_php"
+    def _run_attempt(task_label: str, task_data: dict[str, Any]) -> Optional[str]:
+        nonlocal create_retry_count, task_id
+        create_retry_count = 0
+        task_id = None
+        create_payload = {"clientKey": apikey, "task": task_data}
+        logger.info(f"Trying 2captcha task mode: {task_label}")
+        logger.debug(
+            "2captcha task payload summary "
+            f"({task_label}): type={task_data.get('type')}, "
+            f"url={task_data.get('websiteURL')}, "
+            f"sitekey={task_data.get('websiteKey')}, "
+            f"has_data_s={bool(task_data.get('recaptchaDataSValue'))}, "
+            f"has_proxy={'proxyAddress' in task_data}, "
+            f"has_cookies={bool(task_data.get('cookies'))}"
         )
 
-        if error_to_exit:
-            raise SystemExit()
+        while create_retry_count < max_retry_count:
+            try:
+                response = requests.post(create_task_url, json=create_payload, timeout=request_timeout)
+                response_data = response.json()
+                logger.debug(f"2captcha createTask response ({task_label}): {response_data}")
+            except Exception as exp:
+                create_retry_count += 1
+                logger.error(f"Failed to call 2captcha createTask ({task_label}): {exp}")
+                sleep(5 * config.behavior.wait_factor)
+                continue
 
-        elif error_to_continue:
-            response_retry_count += 1
-            continue
+            error_to_exit, error_to_continue = _check_2captcha_v2_error(response_data, "createTask")
+            if error_to_exit:
+                return None
+            if error_to_continue:
+                create_retry_count += 1
+                continue
 
-        elif error_to_break:
-            if "CAPCHA_NOT_READY" not in response.text:
-                captcha_response = response.text.split("|")[1]
-                return captcha_response
+            task_id = response_data.get("taskId")
+            if task_id:
+                logger.debug(f"2captcha task_id ({task_label}): {task_id}")
+                break
+            create_retry_count += 1
+            sleep(5 * config.behavior.wait_factor)
 
-    if not captcha_response:
-        logger.error("Failed to solve captcha!")
+        if not task_id:
+            logger.error(f"Failed to create 2captcha task ({task_label}).")
+            return None
 
-    return captcha_response
+        sleep(15 * config.behavior.wait_factor)
+        poll_payload = {"clientKey": apikey, "taskId": task_id}
+        poll_retry_count = 0
+        while poll_retry_count < max_retry_count:
+            try:
+                response = requests.post(
+                    get_task_result_url, json=poll_payload, timeout=request_timeout
+                )
+                response_data = response.json()
+                logger.debug(f"2captcha getTaskResult ({task_label}): {response_data}")
+            except Exception as exp:
+                poll_retry_count += 1
+                logger.error(f"Failed to call 2captcha getTaskResult ({task_label}): {exp}")
+                sleep(5 * config.behavior.wait_factor)
+                continue
+
+            poll_status = str(response_data.get("status", "")).strip() or "unknown"
+            if poll_hook:
+                try:
+                    poll_hook(f"{task_label}:{poll_status}", poll_retry_count)
+                except Exception as exp:
+                    logger.debug(f"2captcha poll hook failed: {exp}")
+
+            error_to_exit, error_to_continue = _check_2captcha_v2_error(
+                response_data, "getTaskResult"
+            )
+            if error_to_exit:
+                return None
+            if error_to_continue:
+                poll_retry_count += 1
+                continue
+            if poll_status == "processing":
+                wait_time = 5 * config.behavior.wait_factor
+                logger.info(f"Waiting {wait_time} seconds before checking response again...")
+                sleep(wait_time)
+                poll_retry_count += 1
+                continue
+            if poll_status == "ready":
+                solution = response_data.get("solution", {})
+                token = solution.get("gRecaptchaResponse") or solution.get("token")
+                return str(token) if token else None
+            poll_retry_count += 1
+            sleep(5 * config.behavior.wait_factor)
+        return None
+
+    for label, task in attempts:
+        token = _run_attempt(label, task)
+        if token:
+            return token
+
+    logger.error("Failed to solve captcha!")
+    return None
 
 
 def take_screenshot(driver: undetected_chromedriver.Chrome) -> None:
@@ -542,77 +626,75 @@ def get_random_sleep(start: float, end: float) -> float:
     return round(random.uniform(start, end), 2)
 
 
-def _check_error(response_text: str, request_type: str = "in_php") -> tuple[bool, bool, bool]:
-    """Check errors returned from requests to in.php or res.php endpoints
+def _normalize_2captcha_cookies(cookies: str) -> str:
+    """Convert cookie pairs to the format expected by 2captcha v2.
 
-    :type response_text: str
-    :param response_text: Response returned from the request
-    :request_type: str
-    :param request_type: Request type to differentiate error groups
-    :rtype: tuple
-    :returns: Flags for exit, continue, and break
+    The project historically used "name:value; ..." while v2 expects "name=value; ...".
     """
 
-    logger.debug("Checking error code...")
+    cookie_pairs = []
+    for pair in cookies.split(";"):
+        item = pair.strip()
+        if not item:
+            continue
+        if "=" in item:
+            cookie_pairs.append(item)
+        elif ":" in item:
+            name, value = item.split(":", 1)
+            cookie_pairs.append(f"{name.strip()}={value.strip()}")
+        else:
+            cookie_pairs.append(item)
+    return "; ".join(cookie_pairs)
 
-    error_to_exit, error_to_continue, error_to_break = False, False, False
+
+def _check_2captcha_v2_error(response_data: dict[str, Any], stage: str) -> tuple[bool, bool]:
+    """Check error object returned by 2captcha API v2."""
+
+    logger.debug("Checking 2captcha v2 response...")
+
+    error_to_exit, error_to_continue = False, False
     error_wait = 5 * config.behavior.wait_factor
 
-    if request_type == "in_php":
-        if "ERROR_WRONG_USER_KEY" in response_text or "ERROR_KEY_DOES_NOT_EXIST" in response_text:
-            logger.error("Invalid API key. Please check your 2captcha API key.")
-            error_to_exit = True
+    error_id = int(response_data.get("errorId", 0) or 0)
+    if error_id == 0:
+        return (False, False)
 
-        elif "ERROR_ZERO_BALANCE" in response_text:
-            logger.error("You don't have funds on your account. Please load your account.")
-            error_to_exit = True
+    error_code = str(response_data.get("errorCode", "")).strip()
+    error_desc = str(response_data.get("errorDescription", "")).strip()
 
-        elif "ERROR_NO_SLOT_AVAILABLE" in response_text:
-            logger.error(
-                "The queue of your captchas that are not distributed to workers is too long."
-            )
-            logger.info(f"Waiting {error_wait} seconds before sending new request...")
-            sleep(error_wait)
+    if error_code in {"ERROR_WRONG_USER_KEY", "ERROR_KEY_DOES_NOT_EXIST"}:
+        logger.error("Invalid API key. Please check your 2captcha API key.")
+        error_to_exit = True
 
-            error_to_continue = True
+    elif error_code == "ERROR_ZERO_BALANCE":
+        logger.error("You don't have funds on your account. Please load your account.")
+        error_to_exit = True
 
-        elif "IP_BANNED" in response_text:
-            logger.error(
-                "Your IP address is banned due to many frequent attempts to access the server"
-            )
-            error_to_exit = True
+    elif error_code == "ERROR_NO_SLOT_AVAILABLE":
+        logger.error(
+            "No worker slot is available for this captcha right now. Waiting before retry..."
+        )
+        logger.info(f"Waiting {error_wait} seconds before retrying {stage}...")
+        sleep(error_wait)
+        error_to_continue = True
 
-        elif "ERROR_GOOGLEKEY" in response_text:
-            logger.error("Blank or malformed sitekey.")
-            error_to_exit = True
+    elif error_code in {"ERROR_IP_BLOCKED", "IP_BANNED", "ERROR_ACCOUNT_SUSPENDED"}:
+        logger.error("2captcha rejected this client IP/account (blocked or suspended).")
+        error_to_exit = True
 
-        else:
-            logger.debug(response_text)
-            error_to_break = True
+    elif error_code in {"ERROR_GOOGLEKEY", "ERROR_PAGEURL"}:
+        logger.error("Blank or malformed sitekey/page URL for 2captcha task.")
+        error_to_exit = True
 
-    elif request_type == "res_php":
-        if "ERROR_WRONG_USER_KEY" in response_text or "ERROR_KEY_DOES_NOT_EXIST" in response_text:
-            logger.error("Invalid API key. Please check your 2captcha API key.")
-            error_to_exit = True
-
-        elif "ERROR_CAPTCHA_UNSOLVABLE" in response_text:
-            logger.error("Unable to solve the captcha.")
-            error_to_exit = True
-
-        elif "CAPCHA_NOT_READY" in response_text:
-            logger.info(f"Waiting {error_wait} seconds before checking response again...")
-            sleep(error_wait)
-
-            error_to_continue = True
-
-        else:
-            logger.debug(response_text)
-            error_to_break = True
+    elif error_code == "ERROR_CAPTCHA_UNSOLVABLE":
+        logger.error("Unable to solve the captcha.")
+        error_to_exit = True
 
     else:
-        logger.error(f"Wrong request type: {request_type}")
+        logger.error(f"2captcha {stage} error: {error_code} ({error_desc})")
+        error_to_exit = True
 
-    return (error_to_exit, error_to_continue, error_to_break)
+    return (error_to_exit, error_to_continue)
 
 
 def get_locale_language(country_code: str) -> str:

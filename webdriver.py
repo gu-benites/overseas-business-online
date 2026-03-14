@@ -1,11 +1,23 @@
 import os
+import platform
 import random
+import string
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 from time import sleep
 from typing import Optional, Union
+
+# ---------------------------------------------------------------------------
+# Headful display auto-detection
+# On the ARM64 VPS the XRDP server exposes Display :10.  When no DISPLAY is
+# set (e.g. script launched over plain SSH) we fall back to it so that the
+# headful Chromium instance has a valid X server to attach to.
+# If Xvfb is preferred instead, start it before the script and export DISPLAY.
+# ---------------------------------------------------------------------------
+if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+    os.environ["DISPLAY"] = ":10"
 
 try:
     import requests
@@ -22,7 +34,7 @@ except ImportError:
 
 try:
     import pyautogui
-except Exception as exp:
+except BaseException as exp:
     pyautogui = None
     PYAUTOGUI_IMPORT_ERROR = exp
 else:
@@ -38,6 +50,70 @@ from utils import get_location, get_locale_language, get_random_sleep
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
 
 
+def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
+    """Pin IPRoyal residential proxies to a sticky session for one browser run."""
+
+    if not proxy or "@" not in proxy:
+        return proxy
+
+    creds, host_port = proxy.split("@", 1)
+    if ":" not in creds:
+        return proxy
+
+    username, password = creds.split(":", 1)
+    if "iproyal.com" not in host_port.lower():
+        return proxy
+    if "_session-" in password:
+        return proxy
+
+    session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    sticky_password = f"{password}_session-{session_id}_lifetime-{lifetime}"
+    sticky_proxy = f"{username}:{sticky_password}@{host_port}"
+    logger.debug(
+        "Applied sticky proxy session for browser run: "
+        f"host={host_port}, session_id={session_id}, lifetime={lifetime}"
+    )
+    return sticky_proxy
+
+
+def _extract_proxy_session_id(proxy: str) -> Optional[str]:
+    if not proxy or "_session-" not in proxy:
+        return None
+    try:
+        segment = proxy.split("_session-", 1)[1]
+        return segment.split("_", 1)[0]
+    except Exception:
+        return None
+
+
+def _ensure_seleniumbase_uses_system_chromedriver() -> None:
+    """Replace SeleniumBase's local chromedriver with the system ARM binary."""
+
+    try:
+        import seleniumbase
+    except Exception:
+        return
+
+    driver_dir = Path(seleniumbase.__file__).resolve().parent / "drivers"
+    local_driver = driver_dir / "chromedriver"
+    system_driver = Path("/usr/bin/chromedriver")
+
+    if not system_driver.exists():
+        return
+
+    if local_driver.exists():
+        try:
+            local_driver.unlink()
+        except Exception:
+            pass
+
+    try:
+        local_driver.symlink_to(system_driver)
+        logger.debug(f"SeleniumBase chromedriver linked to system driver: {system_driver}")
+    except Exception as exp:
+        logger.debug(f"Failed to link SeleniumBase chromedriver to system driver: {exp}")
+
+
 def _require_pyautogui(feature_name: str):
     """Load pyautogui only for features that require a desktop session."""
 
@@ -50,25 +126,45 @@ def _require_pyautogui(feature_name: str):
 
 
 def _get_browser_binary_path() -> str:
-    """Find a usable Chrome/Chromium binary for undetected_chromedriver."""
+    """Find a usable Chrome/Chromium binary for undetected_chromedriver.
 
-    candidates = [
-        os.getenv("CHROME_BINARY"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        "/opt/google/chrome/chrome",
-        "/snap/bin/chromium",
-    ]
+    On ARM64 systems (like the Oracle Ampere VPS) the standard Google Chrome
+    .deb is not available, so we prioritise ``chromium`` / ``chromium-browser``
+    which are shipped by Debian/Ubuntu for aarch64.
+    """
+
+    is_arm = platform.machine() in ("aarch64", "arm64", "armv8l")
+
+    if is_arm:
+        candidates = [
+            os.getenv("CHROME_BINARY"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+            "/snap/bin/chromium",
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            "/opt/google/chrome/chrome",
+        ]
+    else:
+        candidates = [
+            os.getenv("CHROME_BINARY"),
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+            "/opt/google/chrome/chrome",
+            "/snap/bin/chromium",
+        ]
 
     for candidate in candidates:
         if candidate and Path(candidate).exists():
             return str(candidate)
 
     raise RuntimeError(
-        "Chrome/Chromium binary not found. Install Chrome or set the CHROME_BINARY environment variable."
+        "Chrome/Chromium binary not found. Install chromium (ARM64) or "
+        "Google Chrome (x86_64), or set the CHROME_BINARY environment variable."
     )
+
 
 
 class CustomChrome(undetected_chromedriver.Chrome):
@@ -178,6 +274,8 @@ def create_webdriver(
         logger.debug("Using SeleniumBase...")
         return create_seleniumbase_driver(proxy, user_agent)
 
+    proxy = _apply_sticky_session_to_proxy(proxy)
+
     geolocation_db_client = GeolocationDB()
 
     chrome_options = undetected_chromedriver.ChromeOptions()
@@ -185,6 +283,8 @@ def create_webdriver(
     chrome_options.add_argument("--no-first-run")
     chrome_options.add_argument("--no-service-autorun")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--disable-popup-blocking")
     chrome_options.add_argument("--disable-notifications")
@@ -250,7 +350,6 @@ def create_webdriver(
         driver_exe_path = _get_driver_exe_path()
 
     browser_binary_path = _get_browser_binary_path()
-
     if proxy:
         if config.webdriver.auth:
             if "@" not in proxy or proxy.count(":") != 2:
@@ -267,6 +366,9 @@ def create_webdriver(
 
             logger.info(f"Using proxy: {masked_proxy}")
             logger.debug(f"Using proxy: {proxy}")
+            session_id = _extract_proxy_session_id(proxy)
+            if session_id:
+                logger.info(f"Proxy sticky session id: {session_id}")
 
             install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
             sleep(2 * config.behavior.wait_factor)
@@ -289,7 +391,7 @@ def create_webdriver(
             ),
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
-            use_subprocess=False,
+            use_subprocess=True,
         )
 
         accuracy = 95
@@ -314,6 +416,7 @@ def create_webdriver(
             logger.debug(
                 f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
             )
+        driver._active_proxy = proxy
 
     else:
         driver = CustomChrome(
@@ -323,8 +426,9 @@ def create_webdriver(
             ),
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
-            use_subprocess=False,
+            use_subprocess=True,
         )
+        driver._active_proxy = None
 
     if config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
@@ -359,6 +463,9 @@ def create_seleniumbase_driver(
     """
 
     geolocation_db_client = GeolocationDB()
+    proxy = _apply_sticky_session_to_proxy(proxy)
+    browser_binary_path = _get_browser_binary_path()
+    _ensure_seleniumbase_uses_system_chromedriver()
 
     country_code = None
 
@@ -378,6 +485,9 @@ def create_seleniumbase_driver(
 
             logger.info(f"Using proxy: {masked_proxy}")
             logger.debug(f"Using proxy: {proxy}")
+            session_id = _extract_proxy_session_id(proxy)
+            if session_id:
+                logger.info(f"Proxy sticky session id: {session_id}")
         else:
             logger.info(f"Using proxy: {proxy}")
 
@@ -387,13 +497,9 @@ def create_seleniumbase_driver(
         if config.webdriver.language_from_proxy:
             lang = get_locale_language(country_code)
 
-    base_dir = Path(tempfile.gettempdir()) / "sb_profiles"
-    base_dir.mkdir(exist_ok=True)
-    profile_dir = base_dir / f"profile_{random.randint(1000,9999)}"
-
     driver = seleniumbase.get_driver(
         browser_name="chrome",
-        undetectable=True,
+        undetectable=False,
         headless2=False,
         do_not_track=True,
         user_agent=user_agent,
@@ -401,29 +507,34 @@ def create_seleniumbase_driver(
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
         locale_code=str(lang) if config.webdriver.language_from_proxy else None,
-        user_data_dir=str(profile_dir),
+        binary_location=browser_binary_path,
+        no_sandbox=True,
+        disable_gpu=True,
     )
 
     # set geolocation and timezone if available
     if proxy and lat and long:
         accuracy = 95
-        driver.execute_cdp_cmd(
-            "Emulation.setGeolocationOverride",
-            {"latitude": lat, "longitude": long, "accuracy": accuracy},
-        )
+        try:
+            driver.execute_cdp_cmd(
+                "Emulation.setGeolocationOverride",
+                {"latitude": lat, "longitude": long, "accuracy": accuracy},
+            )
 
-        if not timezone:
-            response = requests.get(f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}")
-            if response.status_code == 200:
-                timezone = response.json()["tz_name"]
+            if not timezone:
+                response = requests.get(f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}")
+                if response.status_code == 200:
+                    timezone = response.json()["tz_name"]
 
-        driver._custom_timezone = timezone
+            driver._custom_timezone = timezone
+            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
 
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
-        logger.debug(
-            f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
-        )
+            logger.debug(
+                f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
+            )
+        except Exception as exp:
+            logger.debug(f"Skipping SeleniumBase CDP geo/timezone override: {exp}")
+    driver._active_proxy = proxy if proxy else None
 
     # handle window size and position
     if config.webdriver.window_size:

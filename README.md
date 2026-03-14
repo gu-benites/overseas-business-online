@@ -78,9 +78,6 @@ See [here](https://github.com/coskundeniz/ad_clicker/wiki/Setup-for-Windows) for
 * Before running the below commands for the first time, run `python ad_clicker.py -q test` once and end it by pressing CTRL+C after seeing the browser opened.
 
 * Run `python ad_clicker.py` for a single run with single browser.
-* Run `python ad_clicker.py --smoke_test` for a safe browser/proxy smoke test that opens a neutral page and exits.
-* Run `python ad_clicker.py --smoke_test --query "desentupidora porto alegre zn"` for a safe Google search smoke test that also saves a screenshot.
-    * The smoke test uses Playwright with the local Chrome/Chromium binary and is intended for headless/server verification.
 * Run `python run_ad_clicker.py` for a single run with multiple browsers.
 * Run `python run_in_loop.py` for running in loop with either single or multiple browsers.
 * Run `streamlit run streamlit_gui.py` for opening the web UI at `http://localhost:8501` and configure/run.

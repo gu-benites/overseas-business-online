@@ -1,5 +1,4 @@
 import random
-import requests
 import shutil
 import string
 import traceback
@@ -8,8 +7,6 @@ from datetime import datetime
 from itertools import chain, filterfalse, zip_longest
 from pathlib import Path
 from time import sleep
-from typing import Optional
-from urllib.parse import quote_plus
 
 import hooks
 from clicklogs_db import ClickLogsDB
@@ -23,7 +20,7 @@ from utils import (
     take_screenshot,
     generate_click_report,
 )
-from webdriver import _get_browser_binary_path, create_webdriver
+from webdriver import create_webdriver
 
 
 if config.behavior.telegram_enabled:
@@ -31,9 +28,6 @@ if config.behavior.telegram_enabled:
 
 
 __author__ = "Coşkun Deniz <coskun.denize@gmail.com>"
-
-SMOKE_TEST_URL = "https://ipv4.icanhazip.com"
-SMOKE_TEST_SCREENSHOT_DIR = Path.cwd() / ".streamlit_uploads" / "smoke_test_screenshots"
 
 
 def get_arg_parser() -> ArgumentParser:
@@ -62,123 +56,9 @@ def get_arg_parser() -> ArgumentParser:
     arg_parser.add_argument(
         "--check_stealth", action="store_true", help="Check stealth for undetection"
     )
-    arg_parser.add_argument(
-        "--smoke_test",
-        action="store_true",
-        help="Launch the browser with the current proxy, open a neutral page, and exit",
-    )
     arg_parser.add_argument("-d", "--device_id", help="Android device ID for assigning to browser")
 
     return arg_parser
-
-
-def _build_playwright_proxy(proxy: Optional[str]) -> Optional[dict[str, str]]:
-    """Convert the existing proxy string format into Playwright launch config."""
-
-    if not proxy:
-        return None
-
-    if config.webdriver.auth:
-        if "@" not in proxy or proxy.count(":") < 2:
-            raise ValueError(
-                "Invalid proxy format! Should be in 'username:password@host:port' format"
-            )
-
-        auth_part, server_part = proxy.split("@", 1)
-        username, password = auth_part.split(":", 1)
-        host, port = server_part.rsplit(":", 1)
-
-        return {
-            "server": f"http://{host}:{port}",
-            "username": username,
-            "password": password,
-        }
-
-    proxy_server = proxy if "://" in proxy else f"http://{proxy}"
-    return {"server": proxy_server}
-
-
-def _build_requests_proxies(proxy: Optional[str]) -> Optional[dict[str, str]]:
-    if not proxy:
-        return None
-
-    proxy_url = proxy if "://" in proxy else f"http://{proxy}"
-    return {"http": proxy_url, "https": proxy_url}
-
-
-def _build_smoke_test_target(query: Optional[str]) -> str:
-    if not query:
-        return SMOKE_TEST_URL
-
-    return f"https://www.google.com/search?q={quote_plus(query)}"
-
-
-def _save_smoke_test_screenshot(page, query: str) -> Path:
-    SMOKE_TEST_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    query_slug = "-".join(query.lower().split())[:60] or "smoke-test"
-    filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{query_slug}.png"
-    screenshot_path = SMOKE_TEST_SCREENSHOT_DIR / filename
-    page.screenshot(path=str(screenshot_path), full_page=True)
-    return screenshot_path
-
-
-def run_browser_smoke_test(proxy: Optional[str], user_agent: str, query: Optional[str]) -> None:
-    """Open a neutral page in Chromium through Playwright and optionally save a query screenshot."""
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        raise RuntimeError(
-            "Playwright is required for --smoke_test. Install it with 'python -m pip install playwright'."
-        ) from exc
-
-    browser_binary_path = _get_browser_binary_path()
-    proxy_config = _build_playwright_proxy(proxy)
-    target_url = _build_smoke_test_target(query)
-
-    logger.info(f"Starting browser smoke test with {target_url}")
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            executable_path=browser_binary_path,
-            headless=True,
-            proxy=proxy_config if not query else None,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-
-        try:
-            if query:
-                response = requests.get(
-                    target_url,
-                    proxies=_build_requests_proxies(proxy),
-                    headers={"User-Agent": user_agent},
-                    timeout=30,
-                )
-                page = browser.new_page(viewport={"width": 1440, "height": 2200})
-                page.set_content(response.text, wait_until="domcontentloaded")
-                logger.info(
-                    f"Smoke test query response: status={response.status_code} final_url={response.url}"
-                )
-                screenshot_path = _save_smoke_test_screenshot(page, query)
-                logger.info(f"Smoke test screenshot saved: {screenshot_path}")
-            else:
-                page = browser.new_page(user_agent=user_agent)
-                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                sleep(1 * config.behavior.wait_factor)
-
-                page_text = (page.text_content("body") or "").strip()
-
-                logger.info(f"Smoke test page loaded: {page.url}")
-
-                if page_text:
-                    logger.info(f"Smoke test exit IP: {page_text}")
-                else:
-                    logger.info("Smoke test loaded, but the page body was empty.")
-
-            if proxy:
-                logger.debug(f"Smoke test used proxy: {proxy}")
-        finally:
-            browser.close()
 
 
 def main():
@@ -248,17 +128,14 @@ def main():
         proxy = None
 
     query = args.query.strip() if args.query else None
-    domains = []
+    if not query:
+        if not config.behavior.query:
+            logger.error("Fill the query parameter!")
+            raise SystemExit()
 
-    if not args.smoke_test:
-        if not query:
-            if not config.behavior.query:
-                logger.error("Fill the query parameter!")
-                raise SystemExit()
+        query = config.behavior.query
 
-            query = config.behavior.query
-
-        domains = get_domains()
+    domains = get_domains()
 
     user_agent = get_random_user_agent_string()
 
@@ -268,10 +145,6 @@ def main():
     search_controller = None
 
     try:
-        if args.smoke_test:
-            run_browser_smoke_test(proxy, user_agent, query)
-            return
-
         driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
 
         if args.check_stealth:

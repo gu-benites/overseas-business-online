@@ -6,7 +6,10 @@ class SearchStats:
 
     browser_id: int = 0
     captcha_seen: bool = False
-    captcha_solved: bool = False
+    captcha_token_received: bool = False
+    captcha_token_applied: bool = False
+    captcha_accepted: bool = False
+    google_blocked_after_captcha: bool = False
     ads_found: int = 0
     num_filtered_ads: int = 0
     num_excluded_ads: int = 0
@@ -27,7 +30,13 @@ class SearchStats:
         lines = [
             ("Browser ID", self.browser_id) if self.browser_id else None,
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
-            ("Captcha Solved", "Yes" if self.captcha_solved else "No"),
+            ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
+            ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),
+            ("Captcha Accepted", "Yes" if self.captcha_accepted else "No"),
+            (
+                "Google Blocked After Captcha",
+                "Yes" if self.google_blocked_after_captcha else "No",
+            ),
             ("Ads Found", self.ads_found),
             ("Num Filtered Ads", self.num_filtered_ads),
             ("Num Excluded Ads", self.num_excluded_ads),
@@ -53,7 +62,13 @@ class SearchStats:
         rows = [
             ("Browser ID", self.browser_id) if self.browser_id else None,
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
-            ("Captcha Solved", "Yes" if self.captcha_solved else "No"),
+            ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
+            ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),
+            ("Captcha Accepted", "Yes" if self.captcha_accepted else "No"),
+            (
+                "Google Blocked After Captcha",
+                "Yes" if self.google_blocked_after_captcha else "No",
+            ),
             ("Ads Found", self.ads_found),
             ("Num Filtered Ads", self.num_filtered_ads),
             ("Num Excluded Ads", self.num_excluded_ads),
