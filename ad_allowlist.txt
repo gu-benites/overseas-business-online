@@ -1,0 +1,2 @@
+# One domain per line.
+# If this file has entries, only ads whose target domain matches one of them will be clicked.

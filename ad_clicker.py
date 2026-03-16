@@ -15,6 +15,7 @@ from logger import logger, update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
 from utils import (
+    get_queries,
     get_random_user_agent_string,
     get_domains,
     take_screenshot,
@@ -28,6 +29,41 @@ if config.behavior.telegram_enabled:
 
 
 __author__ = "Coşkun Deniz <coskun.denize@gmail.com>"
+
+
+def _get_next_query(current_query: str) -> str:
+    """Get the next query from query_file, or reuse current query if unavailable."""
+
+    if not config.paths.query_file:
+        return current_query
+
+    queries = [query.strip() for query in get_queries() if query.strip()]
+    if not queries:
+        return current_query
+
+    try:
+        current_index = queries.index(current_query)
+    except ValueError:
+        return queries[0]
+
+    return queries[(current_index + 1) % len(queries)]
+
+
+def _should_retry_when_no_clickable_ads() -> bool:
+    retry_probability = float(config.behavior.no_clickable_ads_retry_probability)
+    exit_probability = float(config.behavior.no_clickable_ads_exit_probability)
+    total = retry_probability + exit_probability
+    if total <= 0:
+        return False
+
+    threshold = retry_probability / total
+    roll = random.random()
+    logger.debug(
+        "No-clickable-ads fallback roll: "
+        f"roll={roll:.4f}, retry_threshold={threshold:.4f}, "
+        f"retry_probability={retry_probability}, exit_probability={exit_probability}"
+    )
+    return roll < threshold
 
 
 def get_arg_parser() -> ArgumentParser:
@@ -127,13 +163,13 @@ def main():
     else:
         proxy = None
 
-    query = args.query.strip() if args.query else None
-    if not query:
+    initial_query = args.query.strip() if args.query else None
+    if not initial_query:
         if not config.behavior.query:
             logger.error("Fill the query parameter!")
             raise SystemExit()
 
-        query = config.behavior.query
+        initial_query = config.behavior.query
 
     domains = get_domains()
 
@@ -165,25 +201,49 @@ def main():
         if config.behavior.hooks_enabled:
             hooks.before_search_hook(driver)
 
-        search_controller = SearchController(driver, query, country_code)
+        current_query = initial_query
+        retries_done = 0
+        max_retries = max(0, int(config.behavior.no_clickable_ads_max_retries))
 
-        if args.id:
-            search_controller.set_browser_id(args.id)
+        while True:
+            search_controller = SearchController(driver, current_query, country_code)
 
-        if args.device_id:
-            search_controller.assign_android_device(args.device_id)
+            if args.id:
+                search_controller.set_browser_id(args.id)
 
-        ads, non_ad_links, shopping_ads = search_controller.search_for_ads(non_ad_domains=domains)
+            if args.device_id:
+                search_controller.assign_android_device(args.device_id)
 
-        if config.behavior.hooks_enabled:
-            hooks.after_search_hook(driver)
+            ads, non_ad_links, shopping_ads = search_controller.search_for_ads(non_ad_domains=domains)
 
-        if not (ads or shopping_ads):
-            logger.info("No ads found in the search results!")
+            if config.behavior.hooks_enabled:
+                hooks.after_search_hook(driver)
 
-            if config.behavior.telegram_enabled:
-                notify_matching_ads(query, links=None, stats=search_controller.stats)
-        else:
+            clickable_ad_count = len(ads) + len(shopping_ads)
+            if clickable_ad_count == 0:
+                logger.info("No clickable ads found in the search results!")
+
+                if config.behavior.telegram_enabled:
+                    notify_matching_ads(current_query, links=None, stats=search_controller.stats)
+
+                if retries_done < max_retries and _should_retry_when_no_clickable_ads():
+                    next_query = (
+                        _get_next_query(current_query)
+                        if config.paths.query_file
+                        else current_query
+                    )
+                    logger.info(
+                        "No-clickable-ads fallback selected retry. "
+                        f"Current query='{current_query}', next query='{next_query}'."
+                    )
+                    current_query = next_query
+                    retries_done += 1
+                    continue
+
+                logger.info("No-clickable-ads fallback selected clean exit.")
+                logger.info(search_controller.stats)
+                break
+
             logger.debug(f"Selected click order: {config.behavior.click_order}")
 
             if config.behavior.click_order == 1:
@@ -219,9 +279,10 @@ def main():
                 hooks.after_clicks_hook(driver)
 
             if config.behavior.telegram_enabled:
-                notify_matching_ads(query, links=ads + shopping_ads, stats=search_controller.stats)
+                notify_matching_ads(current_query, links=ads + shopping_ads, stats=search_controller.stats)
 
             logger.info(search_controller.stats)
+            break
 
     except Exception as exp:
         logger.error("Exception occurred. See the details in the log file.")

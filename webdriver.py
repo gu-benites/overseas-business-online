@@ -86,6 +86,25 @@ def _extract_proxy_session_id(proxy: str) -> Optional[str]:
         return None
 
 
+def _infer_country_code_from_proxy(proxy: str) -> Optional[str]:
+    """Infer country code from provider proxy options when IP lookup fails."""
+
+    if not proxy:
+        return None
+
+    proxy_lower = proxy.lower()
+    for marker in ("_country-", "-country-", "_country_", "-country_"):
+        if marker in proxy_lower:
+            try:
+                suffix = proxy_lower.split(marker, 1)[1]
+                candidate = suffix.split("_", 1)[0].split("-", 1)[0]
+                if len(candidate) == 2 and candidate.isalpha():
+                    return candidate.upper()
+            except Exception:
+                return None
+    return None
+
+
 def _ensure_seleniumbase_uses_system_chromedriver() -> None:
     """Replace SeleniumBase's local chromedriver with the system ARM binary."""
 
@@ -302,7 +321,8 @@ def create_webdriver(
     chrome_options.add_argument("--dns-prefetch-disable")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
-    chrome_options.add_argument(f"--user-agent={user_agent}")
+    if user_agent:
+        chrome_options.add_argument(f"--user-agent={user_agent}")
 
     if IS_POSIX:
         chrome_options.add_argument("--disable-setuid-sandbox")
@@ -377,6 +397,14 @@ def create_webdriver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+        if not country_code and getattr(config.webdriver, "identity_mode", "legacy") == "native_linux":
+            inferred_country_code = _infer_country_code_from_proxy(proxy)
+            if inferred_country_code:
+                country_code = inferred_country_code
+                logger.info(
+                    "Identity mode 'native_linux' inferred country from proxy options: "
+                    f"{country_code}"
+                )
         if config.webdriver.language_from_proxy:
             lang = get_locale_language(country_code)
             chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})

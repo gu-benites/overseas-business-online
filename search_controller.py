@@ -34,6 +34,9 @@ from stats import SearchStats
 from utils import (
     Direction,
     add_cookies,
+    domain_matches_url,
+    get_ad_allowlist_domains,
+    get_ad_denylist_domains,
     solve_recaptcha,
     get_random_sleep,
     resolve_redirect,
@@ -96,6 +99,8 @@ class SearchController:
         self._driver = driver
         self._search_query, self._filter_words = self._process_query(query)
         self._exclude_list = None
+        self._ad_allowlist = get_ad_allowlist_domains()
+        self._ad_denylist = get_ad_denylist_domains()
         self._random_mouse_enabled = config.behavior.random_mouse
         self._use_custom_cookies = config.behavior.custom_cookies
         self._twocaptcha_apikey = config.behavior.twocaptcha_apikey
@@ -402,8 +407,10 @@ class SearchController:
         """
 
         url = link_url if category == "Shopping" else link_element.get_attribute("href")
+        logger.info(f"{category} click target URL: {url}")
 
         url = resolve_redirect(url)
+        logger.info(f"{category} final resolved URL: {url}")
 
         adb_controller.open_url(url, self._android_device_id)
 
@@ -479,7 +486,11 @@ class SearchController:
                 self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
 
                 sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
-                logger.debug(f"Current url on new tab: {self._driver.current_url}")
+                clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
+                final_landed_url = self._driver.current_url
+                logger.info(f"{category} click target URL: {clicked_target_url}")
+                logger.info(f"{category} final landed URL: {final_landed_url}")
+                logger.debug(f"Current url on new tab: {final_landed_url}")
 
                 if self._hooks_enabled and category in ("Ad", "Shopping"):
                     hooks.after_ad_click_hook(self._driver)
@@ -487,15 +498,15 @@ class SearchController:
                 self._start_random_action_threads()
 
                 url = (
-                    "/".join(self._driver.current_url.split("/", maxsplit=3)[:3])
+                    "/".join(final_landed_url.split("/", maxsplit=3)[:3])
                     if category == "Shopping"
-                    else (link_url if is_ad_element else self._driver.current_url)
+                    else (link_url if is_ad_element else final_landed_url)
                 )
 
                 self._update_click_stats(url, click_time, category)
 
                 if config.behavior.request_boost:
-                    boost_requests(self._driver.current_url)
+                    boost_requests(final_landed_url)
 
                 wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
                 logger.debug(f"Waiting {wait_time} seconds on {category.lower()} page...")
@@ -813,13 +824,26 @@ class SearchController:
 
         for ad in filtered_ads:
             ad_link = ad.get_attribute("href")
+            ad_target_link = ad.get_attribute("data-pcu") or ad_link
             ad_title = ad.find_element(*self.AD_TITLE).text
             logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
+
+            if self._ad_allowlist:
+                if not any(domain_matches_url(domain, ad_target_link) for domain in self._ad_allowlist):
+                    logger.debug(f"Skipping [{ad_title}] because it is not in ad_allowlist: {ad_target_link}")
+                    self._stats.num_filtered_ads += 1
+                    continue
+
+            if self._ad_denylist:
+                if any(domain_matches_url(domain, ad_target_link) for domain in self._ad_denylist):
+                    logger.debug(f"Skipping [{ad_title}] because it is in ad_denylist: {ad_target_link}")
+                    self._stats.num_excluded_ads += 1
+                    continue
 
             if self._exclude_list:
                 for exclude_item in self._exclude_list:
                     if (
-                        exclude_item in ad.get_attribute("data-pcu")
+                        exclude_item in ad_target_link
                         or exclude_item.lower() in ad_title.lower()
                     ):
                         logger.debug(f"Excluding [{ad_title}]: {ad_link}")

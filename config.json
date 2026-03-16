@@ -3,12 +3,15 @@
         "query_file": "",
         "proxy_file": "proxies.txt",
         "user_agents": "user_agents.txt",
-        "filtered_domains": "domains.txt"
+        "filtered_domains": "domains.txt",
+        "ad_allowlist": "ad_allowlist.txt",
+        "ad_denylist": "ad_denylist.txt"
     },
     "webdriver": {
         "proxy": "",
         "auth": true,
         "incognito": false,
+        "identity_mode": "native_linux",
         "country_domain": true,
         "language_from_proxy": true,
         "ss_on_exception": false,
@@ -34,10 +37,13 @@
         "wait_factor": 1.0,
         "running_interval_start": "00:00",
         "running_interval_end": "00:00",
-        "2captcha_apikey": "",
+        "2captcha_apikey": "cc5d59bffc2dc631ac24979a12d07dd1",
         "hooks_enabled": false,
         "telegram_enabled": false,
         "send_to_android": false,
-        "request_boost": false
+        "request_boost": false,
+        "no_clickable_ads_retry_probability": 0.7,
+        "no_clickable_ads_exit_probability": 0.3,
+        "no_clickable_ads_max_retries": 1
     }
 }

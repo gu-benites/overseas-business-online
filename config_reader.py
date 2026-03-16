@@ -12,6 +12,8 @@ class PathParams:
     proxy_file: str
     user_agents: Optional[str] = "user_agents.txt"
     filtered_domains: Optional[str] = "domains.txt"
+    ad_allowlist: Optional[str] = "ad_allowlist.txt"
+    ad_denylist: Optional[str] = "ad_denylist.txt"
 
 
 @dataclass
@@ -19,6 +21,7 @@ class WebdriverParams:
     proxy: str
     auth: Optional[bool] = False
     incognito: Optional[bool] = False
+    identity_mode: Optional[str] = "legacy"
     country_domain: Optional[bool] = False
     language_from_proxy: Optional[bool] = False
     ss_on_exception: Optional[bool] = False
@@ -51,6 +54,9 @@ class BehaviorParams:
     telegram_enabled: Optional[bool] = False
     send_to_android: Optional[bool] = False
     request_boost: Optional[bool] = False
+    no_clickable_ads_retry_probability: Optional[float] = 0.7
+    no_clickable_ads_exit_probability: Optional[float] = 0.3
+    no_clickable_ads_max_retries: Optional[int] = 1
 
 
 class ConfigReader:
@@ -76,6 +82,8 @@ class ConfigReader:
             proxy_file=config["paths"]["proxy_file"],
             user_agents=config["paths"]["user_agents"],
             filtered_domains=config["paths"]["filtered_domains"],
+            ad_allowlist=config["paths"].get("ad_allowlist", "ad_allowlist.txt"),
+            ad_denylist=config["paths"].get("ad_denylist", "ad_denylist.txt"),
         )
 
         if self.paths.proxy_file and config["webdriver"]["proxy"]:
@@ -86,6 +94,7 @@ class ConfigReader:
             proxy=config["webdriver"]["proxy"],
             auth=config["webdriver"]["auth"],
             incognito=config["webdriver"]["incognito"],
+            identity_mode=config["webdriver"].get("identity_mode", "legacy"),
             country_domain=config["webdriver"]["country_domain"],
             language_from_proxy=config["webdriver"]["language_from_proxy"],
             ss_on_exception=config["webdriver"]["ss_on_exception"],
@@ -123,6 +132,15 @@ class ConfigReader:
             telegram_enabled=config["behavior"]["telegram_enabled"],
             send_to_android=config["behavior"]["send_to_android"],
             request_boost=config["behavior"]["request_boost"],
+            no_clickable_ads_retry_probability=config["behavior"].get(
+                "no_clickable_ads_retry_probability", 0.7
+            ),
+            no_clickable_ads_exit_probability=config["behavior"].get(
+                "no_clickable_ads_exit_probability", 0.3
+            ),
+            no_clickable_ads_max_retries=config["behavior"].get(
+                "no_clickable_ads_max_retries", 1
+            ),
         )
 
 

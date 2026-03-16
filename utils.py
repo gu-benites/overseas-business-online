@@ -1,6 +1,8 @@
 import json
 import platform
 import random
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +12,7 @@ from itertools import cycle
 from pathlib import Path
 from time import sleep
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 try:
     import requests
@@ -47,6 +50,11 @@ def get_random_user_agent_string() -> str:
     :returns: User agent string
     """
 
+    identity_mode = getattr(config.webdriver, "identity_mode", "legacy")
+    if identity_mode == "native_linux":
+        logger.info("Identity mode 'native_linux' enabled. Using browser native Linux desktop identity.")
+        return None
+
     all_user_agents = _get_user_agents(config.paths.user_agents)
 
     current_os = platform.system()
@@ -76,6 +84,28 @@ def get_random_user_agent_string() -> str:
     logger.debug(f"user_agent: {user_agent_string}")
 
     return user_agent_string
+
+
+def get_browser_major_version() -> Optional[int]:
+    """Read the installed Chromium/Chrome major version."""
+
+    candidates = (
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        "/usr/bin/chromium",
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            output = subprocess.check_output([candidate, "--version"], text=True, timeout=5).strip()
+            version_text = output.split()[-1]
+            return int(version_text.split(".", 1)[0])
+        except Exception:
+            continue
+    return None
 
 
 def _get_user_agents(user_agent_file: Path) -> list[str]:
@@ -334,6 +364,50 @@ def get_domains() -> list[str]:
     logger.debug(f"Domains: {domains}")
 
     return domains
+
+
+def get_ad_allowlist_domains() -> list[str]:
+    return _get_optional_domains(Path(config.paths.ad_allowlist), "Ad allowlist")
+
+
+def get_ad_denylist_domains() -> list[str]:
+    return _get_optional_domains(Path(config.paths.ad_denylist), "Ad denylist")
+
+
+def _get_optional_domains(filepath: Path, label: str) -> list[str]:
+    """Read an optional domain list file. Missing file means empty list."""
+
+    if not filepath.exists():
+        logger.debug(f"{label} file not found: {filepath}. Continuing with empty list.")
+        return []
+
+    with open(filepath, encoding="utf-8") as domainsfile:
+        domains = [
+            domain.strip().replace("'", "").replace('"', "")
+            for domain in domainsfile.read().splitlines()
+            if domain.strip()
+        ]
+
+    logger.debug(f"{label}: {domains}")
+    return domains
+
+
+def domain_matches_url(domain: str, url: str) -> bool:
+    """Return True if the given domain matches the URL hostname."""
+
+    if not domain or not url:
+        return False
+
+    normalized_domain = domain.lower().strip()
+    if normalized_domain.startswith("http://") or normalized_domain.startswith("https://"):
+        normalized_domain = urlparse(normalized_domain).netloc.lower()
+    normalized_domain = normalized_domain.lstrip(".")
+
+    parsed = urlparse(url)
+    hostname = (parsed.netloc or parsed.path or "").lower()
+    hostname = hostname.split("@")[-1].split(":")[0]
+
+    return hostname == normalized_domain or hostname.endswith(f".{normalized_domain}")
 
 
 def add_cookies(driver: undetected_chromedriver.Chrome) -> None:
