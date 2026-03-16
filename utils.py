@@ -385,7 +385,7 @@ def _get_optional_domains(filepath: Path, label: str) -> list[str]:
         domains = [
             domain.strip().replace("'", "").replace('"', "")
             for domain in domainsfile.read().splitlines()
-            if domain.strip()
+            if domain.strip() and not domain.strip().startswith("#")
         ]
 
     logger.debug(f"{label}: {domains}")
@@ -481,7 +481,7 @@ def solve_recaptcha(
     max_retry_count = 13
     create_retry_count = 0
     request_timeout = 30
-    max_poll_seconds = max(180, int(180 * config.behavior.wait_factor))
+    max_poll_seconds = max(240, int(240 * config.behavior.wait_factor))
     poll_interval_seconds = max(5, int(5 * config.behavior.wait_factor))
     task_id = None
 
@@ -526,9 +526,13 @@ def solve_recaptcha(
     attempts: list[tuple[str, dict[str, Any]]] = []
     proxy_cfg = _parse_proxy(proxy or "")
     if proxy_cfg:
-        task_v2_enterprise_proxy = dict(base_task)
-        task_v2_enterprise_proxy.update({"type": "RecaptchaV2EnterpriseTask", **proxy_cfg})
-        attempts.append(("v2_enterprise_with_proxy", task_v2_enterprise_proxy))
+        # Google Search /sorry/ challenges are currently solving more reliably with
+        # standard proxied reCAPTCHA v2 than with the Enterprise task type here.
+        # Keep Enterprise behind a flag so it can be re-enabled for comparison later.
+        if config.behavior.enable_v2_enterprise_fallback:
+            task_v2_enterprise_proxy = dict(base_task)
+            task_v2_enterprise_proxy.update({"type": "RecaptchaV2EnterpriseTask", **proxy_cfg})
+            attempts.append(("v2_enterprise_with_proxy", task_v2_enterprise_proxy))
 
         task_v2_proxy = dict(base_task)
         task_v2_proxy.update({"type": "RecaptchaV2Task", **proxy_cfg})

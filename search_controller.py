@@ -387,6 +387,33 @@ class SearchController:
 
         return (link_element, link_url, ad_title)
 
+    def _extract_ad_title(self, ad: LinkElement) -> str:
+        """Extract a resilient ad title from the SERP card."""
+
+        try:
+            title = ad.find_element(*self.AD_TITLE).text.strip()
+            if title:
+                return title
+        except NoSuchElementException:
+            pass
+
+        for selector in ("h3", "a h3", "[aria-label]"):
+            try:
+                element = ad.find_element(By.CSS_SELECTOR, selector)
+                text = (element.text or element.get_attribute("aria-label") or "").strip()
+                if text:
+                    return text
+            except NoSuchElementException:
+                continue
+
+        fallback = (
+            ad.get_attribute("data-pcu")
+            or ad.get_attribute("href")
+            or "Untitled ad"
+        )
+        logger.debug(f"Falling back to ad title from URL/attributes: {fallback}")
+        return fallback
+
     def _handle_android_click(
         self,
         link_element: selenium.webdriver.remote.webelement.WebElement,
@@ -806,7 +833,7 @@ class SearchController:
 
         if self._filter_words:
             for ad in cleaned_ads:
-                ad_title = ad.find_element(*self.AD_TITLE).text.lower()
+                ad_title = self._extract_ad_title(ad).lower()
                 ad_link = ad.get_attribute("data-pcu")
 
                 logger.debug(f"data-pcu ad_link: {ad_link}")
@@ -825,7 +852,7 @@ class SearchController:
         for ad in filtered_ads:
             ad_link = ad.get_attribute("href")
             ad_target_link = ad.get_attribute("data-pcu") or ad_link
-            ad_title = ad.find_element(*self.AD_TITLE).text
+            ad_title = self._extract_ad_title(ad)
             logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
 
             if self._ad_allowlist:
