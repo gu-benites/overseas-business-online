@@ -19,6 +19,8 @@ LOCAL_ROOT = ROOT / ".local-system" / "root"
 CHROMEDRIVER = LOCAL_ROOT / "usr" / "bin" / "chromedriver"
 DEFAULT_BINARY = LOCAL_ROOT / "usr" / "lib" / "chromium" / "chromium"
 SCREENSHOT_DIR = ROOT / "artifacts" / "screenshots"
+LOG_DIR = ROOT / "artifacts" / "logs"
+ACCESS_LOG = LOG_DIR / "page_access.log"
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +55,20 @@ def build_driver() -> webdriver.Chrome:
     return webdriver.Chrome(service=Service(str(CHROMEDRIVER)), options=options)
 
 
+def append_access_log(requested_url: str, final_url: str, title: str, screenshot_path: Path) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).isoformat()
+    log_line = (
+        f"{timestamp}"
+        f" requested_url={requested_url}"
+        f" final_url={final_url}"
+        f" title={title!r}"
+        f" screenshot={screenshot_path}\n"
+    )
+    with open(ACCESS_LOG, "a", encoding="utf-8") as log_file:
+        log_file.write(log_line)
+
+
 def main() -> None:
     args = parse_args()
     output_path = make_output_path(args.url, args.output)
@@ -69,9 +85,11 @@ def main() -> None:
             sleep(args.wait_seconds)
 
         driver.save_screenshot(str(output_path))
+        append_access_log(args.url, driver.current_url, driver.title, output_path)
         print(f"TITLE {driver.title}")
         print(f"URL {driver.current_url}")
         print(f"SCREENSHOT {output_path}")
+        print(f"LOG {ACCESS_LOG}")
     finally:
         driver.quit()
 
