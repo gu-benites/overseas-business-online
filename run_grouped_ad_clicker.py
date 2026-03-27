@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import traceback
@@ -13,6 +15,9 @@ from logger import logger
 
 STAT_PATTERN = re.compile(r"^\|\s*(?P<key>[^|]+?)\s*\|\s*(?P<value>[^|]+?)\s*\|$")
 JSON_SUMMARY_PREFIX = "JSON_SUMMARY:"
+UC_PROFILE_MARKER = "/tmp/uc_profiles/"
+PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
+UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -84,6 +89,117 @@ def _log_planned_group(group: GroupRecord, query: GroupQueryRecord) -> None:
         f"city={group.city_name}, rsw_id={group.rsw_id}, enabled={group.enabled}, "
         f"query_pos={query.position}, query='{query.query_text}'"
     )
+
+
+def _list_process_rows() -> list[dict[str, object]]:
+    output = subprocess.check_output(
+        ["ps", "-eo", "pid,ppid,comm,args"],
+        text=True,
+    )
+    rows: list[dict[str, object]] = []
+    for raw_line in output.splitlines()[1:]:
+        parts = raw_line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, comm, args = parts
+        try:
+            rows.append(
+                {
+                    "pid": int(pid),
+                    "ppid": int(ppid),
+                    "comm": comm,
+                    "args": args,
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def _is_ours_browser_process(row: dict[str, object]) -> bool:
+    args = str(row["args"])
+    comm = str(row["comm"])
+    return any(
+        marker in args
+        for marker in (UC_PROFILE_MARKER, PROXY_PLUGIN_MARKER, UC_DRIVER_MARKER)
+    ) or comm.startswith("undetected_chro")
+
+
+def _collect_tree_pids(
+    root_pid: int, children_by_parent: dict[int, list[dict[str, object]]]
+) -> set[int]:
+    collected: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        current = stack.pop()
+        if current in collected:
+            continue
+        collected.add(current)
+        for child in children_by_parent.get(current, []):
+            stack.append(int(child["pid"]))
+    return collected
+
+
+def _cleanup_orphan_browsers() -> None:
+    rows = _list_process_rows()
+    children_by_parent: dict[int, list[dict[str, object]]] = {}
+    for row in rows:
+        children_by_parent.setdefault(int(row["ppid"]), []).append(row)
+
+    orphan_roots = [
+        row
+        for row in rows
+        if int(row["ppid"]) == 1 and _is_ours_browser_process(row)
+    ]
+    if not orphan_roots:
+        logger.debug("Orphan browser cleanup: no orphan browser trees found.")
+        return
+
+    target_pids: set[int] = set()
+    for root in orphan_roots:
+        target_pids.update(_collect_tree_pids(int(root["pid"]), children_by_parent))
+
+    logger.info(
+        "Orphan browser cleanup: "
+        f"found {len(orphan_roots)} orphan root(s), terminating {len(target_pids)} process(es)."
+    )
+
+    for pid in sorted(target_pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            logger.warning(f"Orphan browser cleanup: permission denied for pid={pid}")
+
+    sleep(2)
+
+    survivors: list[int] = []
+    for pid in sorted(target_pids):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            survivors.append(pid)
+        else:
+            survivors.append(pid)
+
+    if not survivors:
+        logger.info("Orphan browser cleanup: all orphan browser processes were terminated.")
+        return
+
+    logger.warning(
+        "Orphan browser cleanup: "
+        f"{len(survivors)} process(es) still alive after SIGTERM. Sending SIGKILL."
+    )
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            logger.warning(f"Orphan browser cleanup: permission denied for pid={pid}")
 
 
 def _run_group_once(db: GroupsDB, group: GroupRecord, query: GroupQueryRecord) -> None:
@@ -224,6 +340,7 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
         _log_planned_group(group, query)
         if dry_run:
             continue
+        _cleanup_orphan_browsers()
         _run_group_once(db, group, query)
     return True
 

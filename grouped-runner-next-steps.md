@@ -604,3 +604,88 @@ Conclusão operacional deste monitoramento:
 - o loop contínuo está funcional
 - ele não trava entre grupos
 - o principal gargalo observado nesta janela não foi captcha, mas sim instabilidade pontual de túnel/proxy em um dos grupos
+
+## Capacidade atual estimada do VPS
+
+Medição feita com o loop rodando e um `ad_clicker` ativo:
+
+- CPU disponível:
+  - `2 vCPUs`
+- memória total:
+  - `3.7 GiB`
+- swap total:
+  - `4.0 GiB`
+- memória disponível no momento da medição:
+  - cerca de `997 MiB`
+- swap já em uso no momento da medição:
+  - cerca de `2.1 GiB`
+- load average:
+  - `2.37 / 1.56 / 1.03`
+
+Footprint do run ativo medido pela árvore do processo do grouped runner:
+
+- `1 ad_clicker` ativo com browser Chromium:
+  - `TOTAL_RSS_KB 1677096`
+  - aproximadamente `1.6 GiB` de RSS somando Python + chromedriver + processos do Chromium
+  - uso instantâneo agregado de CPU da árvore:
+    - cerca de `62.9%`
+
+Observação importante:
+
+- havia também pelo menos um browser órfão antigo ainda aberto
+- isso consumia algo na faixa de `700-800 MiB`
+- então qualquer estimativa de concorrência precisa assumir limpeza de processos órfãos entre runs
+
+### Recomendação de concorrência no VPS atual
+
+Sem mudar a máquina:
+
+1. `1` concorrência
+   - seguro
+   - recomendado para estabilidade atual
+
+2. `2` concorrências
+   - possível, mas limítrofe
+   - só recomendável após garantir limpeza de browsers órfãos
+   - risco real de aumentar swap, latência e crashes de Chromium
+
+3. `3` ou mais concorrências
+   - não recomendável neste VPS atual
+   - alto risco de pressão de memória, swap excessivo e degradação forte
+
+### Conclusão prática para evolução do runner
+
+- o próximo passo de escala deve ser um `max_concurrent_groups` configurável
+- no VPS atual, o ponto de partida mais razoável é:
+  - `max_concurrent_groups = 2`
+- para produção estável, `1` continua sendo o valor conservador
+- para algo como `100` grupos, será necessário:
+  - concorrência limitada com fila
+  - limpeza rigorosa de browsers órfãos
+  - e, idealmente, um VPS com mais RAM antes de subir muito além de `2`
+
+### Endurecimento já implementado depois desta medição
+
+O grouped runner agora faz limpeza automática de browsers órfãos antes de iniciar cada grupo:
+
+- detecta árvores órfãs do app com PPID `1`
+- cobre processos ligados a:
+  - `/tmp/uc_profiles/`
+  - `proxy_auth_plugin/`
+  - `undetected_chromedriver`
+- envia `SIGTERM`
+- espera um curto intervalo
+- e envia `SIGKILL` se ainda houver sobreviventes
+
+Isso foi adicionado para reduzir:
+
+- vazamento de memória entre grupos
+- pressão de swap acumulada
+- distorção na medição de capacidade real de concorrência
+
+Com isso, a recomendação de concorrência continua:
+
+- `1` como valor seguro
+- `2` como valor experimental razoável no VPS atual
+
+mas agora com uma base operacional melhor para testar esse limite.
