@@ -689,3 +689,36 @@ Com isso, a recomendação de concorrência continua:
 - `2` como valor experimental razoável no VPS atual
 
 mas agora com uma base operacional melhor para testar esse limite.
+
+## Concorrência limitada implementada no grouped runner
+
+O [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py) agora suporta concorrência limitada por ciclo.
+
+Capacidades novas:
+
+- parâmetro de CLI:
+  - `--max-concurrent-groups <N>`
+- parâmetro persistido em [`config.json`](/home/otavio/overseas-business-online/config.json):
+  - `behavior.max_concurrent_groups`
+- controle na UI do Streamlit:
+  - `Grouped runner max concurrent groups`
+
+Comportamento:
+
+- `1`:
+  - execução sequencial, como antes
+- `2` ou mais:
+  - o runner usa um pool limitado e dispara até `N` grupos em paralelo dentro do ciclo
+  - cada grupo continua executando o worker real [`ad_clicker.py`](/home/otavio/overseas-business-online/ad_clicker.py)
+  - o cleanup de browsers órfãos continua acontecendo antes de submeter cada novo grupo
+
+Estado atual configurado:
+
+- padrão em config:
+  - `max_concurrent_groups = 2`
+
+Observação operacional:
+
+- isso foi implementado para permitir o próximo passo de escala
+- ainda falta validação longa de estabilidade com `2` concorrências reais em produção
+- se houver aumento de swap, crashes de Chromium ou falhas de túnel, o fallback recomendado continua sendo voltar para `1`

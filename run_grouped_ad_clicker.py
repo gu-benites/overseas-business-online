@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -25,6 +26,11 @@ def get_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Only log the planned rotation")
     parser.add_argument("--once", action="store_true", help="Run exactly one cycle and exit")
     parser.add_argument("--group-city", help="Run only a specific city group")
+    parser.add_argument(
+        "--max-concurrent-groups",
+        type=int,
+        help="Run up to N groups concurrently in each cycle",
+    )
     parser.add_argument(
         "--max-runtime-minutes",
         type=float,
@@ -287,6 +293,15 @@ def _run_group_once(db: GroupsDB, group: GroupRecord, query: GroupQueryRecord) -
     )
 
 
+def _resolve_max_concurrent_groups(cli_value: int | None) -> int:
+    configured = cli_value if cli_value is not None else config.behavior.max_concurrent_groups
+    try:
+        value = int(configured or 1)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, value)
+
+
 def _iter_target_groups(db: GroupsDB, group_city: str | None) -> list[GroupRecord]:
     groups = db.list_groups(enabled_only=True)
     if not group_city:
@@ -336,12 +351,30 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
         logger.info("No runnable active groups found.")
         return False
 
+    max_concurrent_groups = _resolve_max_concurrent_groups(None)
+    logger.info(
+        "Grouped runner concurrency limit: "
+        f"{max_concurrent_groups} group(s) per cycle."
+    )
+
     for group, query in planned:
         _log_planned_group(group, query)
-        if dry_run:
-            continue
-        _cleanup_orphan_browsers()
-        _run_group_once(db, group, query)
+    if dry_run:
+        return True
+
+    if max_concurrent_groups == 1:
+        for group, query in planned:
+            _cleanup_orphan_browsers()
+            _run_group_once(db, group, query)
+        return True
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_concurrent_groups) as executor:
+        for group, query in planned:
+            _cleanup_orphan_browsers()
+            futures.append(executor.submit(_run_group_once, db, group, query))
+        for future in as_completed(futures):
+            future.result()
     return True
 
 
@@ -349,6 +382,8 @@ def main() -> None:
     args = get_arg_parser().parse_args()
     db = GroupsDB()
     deadline = None
+    resolved_max_concurrent_groups = _resolve_max_concurrent_groups(args.max_concurrent_groups)
+    config.behavior.max_concurrent_groups = resolved_max_concurrent_groups
 
     if args.max_runtime_minutes and args.max_runtime_minutes > 0:
         deadline = monotonic() + (args.max_runtime_minutes * 60)
@@ -356,6 +391,10 @@ def main() -> None:
             "Grouped runner max runtime enabled: "
             f"{args.max_runtime_minutes} minute(s)"
         )
+    logger.info(
+        "Grouped runner concurrency configured: "
+        f"{resolved_max_concurrent_groups} group(s)."
+    )
 
     while True:
         if deadline is not None and monotonic() >= deadline:

@@ -489,6 +489,11 @@ with st.expander("Settings", expanded=True):
         loop_wait_time = st.number_input(
             "Loop wait time", min_value=0, value=to_int(behavior.get("loop_wait_time"), 60)
         )
+        max_concurrent_groups = st.number_input(
+            "Max concurrent groups",
+            min_value=1,
+            value=to_int(behavior.get("max_concurrent_groups"), 1),
+        )
         wait_factor = st.number_input(
             "Wait factor",
             min_value=0.1,
@@ -549,6 +554,7 @@ with st.expander("Settings", expanded=True):
                 "browser_count": browser_count,
                 "multiprocess_style": multiprocess_style,
                 "loop_wait_time": loop_wait_time,
+                "max_concurrent_groups": max_concurrent_groups,
                 "wait_factor": to_float(wait_factor, 1.0),
                 "running_interval_start": running_interval_start,
                 "running_interval_end": running_interval_end,
@@ -738,7 +744,19 @@ if all_groups:
             key="grouped_runner_timer_minutes",
         )
 
+    grouped_runner_concurrency = st.number_input(
+        "Grouped runner max concurrent groups",
+        min_value=1,
+        max_value=10,
+        value=to_int(behavior.get("max_concurrent_groups"), 1),
+        step=1,
+        key="grouped_runner_max_concurrent_groups",
+    )
+
     grouped_loop_args: list[str] = []
+    grouped_loop_args.extend(
+        ["--max-concurrent-groups", str(int(grouped_runner_concurrency))]
+    )
     if grouped_runner_timer_enabled:
         grouped_loop_args.extend(
             ["--max-runtime-minutes", str(int(grouped_runner_timer_minutes))]
@@ -756,14 +774,20 @@ if all_groups:
         if st.button("RUN active groups once"):
             start_process(
                 "run_grouped_ad_clicker.py",
-                extra_args=["--once"],
+                extra_args=["--once", "--max-concurrent-groups", str(int(grouped_runner_concurrency))],
                 process_key="run_grouped_ad_clicker_once",
             )
     with runner_col_3:
         if st.button("RUN selected group once") and selected_group:
             start_process(
                 "run_grouped_ad_clicker.py",
-                extra_args=["--once", "--group-city", selected_group.city_name],
+                extra_args=[
+                    "--once",
+                    "--group-city",
+                    selected_group.city_name,
+                    "--max-concurrent-groups",
+                    str(int(grouped_runner_concurrency)),
+                ],
                 process_key="run_grouped_ad_clicker_selected",
             )
 
