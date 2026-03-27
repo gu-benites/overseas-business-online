@@ -25,7 +25,7 @@ def start_tool(
     :type query: str
     :param query: Search query
     :type proxy: str
-    :param proxy: Proxy to use in ip:port or user:pass@host:port format
+    :param proxy: Proxy to use in ip:port, user:pass@host:port, or host:port:user:pass format
     :type start_timeout: float
     :param start_timeout: Start timeout to avoid race condition in driver patching
     :type device_id: str

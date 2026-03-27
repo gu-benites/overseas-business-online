@@ -5,6 +5,9 @@ from dataclasses import dataclass
 class SearchStats:
 
     browser_id: int = 0
+    initial_proxy_ip: str = ""
+    latest_proxy_ip: str = ""
+    ip_changed_mid_session: bool = False
     captcha_seen: bool = False
     captcha_token_received: bool = False
     captcha_token_applied: bool = False
@@ -29,6 +32,9 @@ class SearchStats:
 
         lines = [
             ("Browser ID", self.browser_id) if self.browser_id else None,
+            ("Initial Proxy IP", self.initial_proxy_ip) if self.initial_proxy_ip else None,
+            ("Latest Proxy IP", self.latest_proxy_ip) if self.latest_proxy_ip else None,
+            ("IP Changed Mid-session", "Yes" if self.ip_changed_mid_session else "No"),
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
             ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
             ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),
@@ -61,6 +67,9 @@ class SearchStats:
     def __str__(self):
         rows = [
             ("Browser ID", self.browser_id) if self.browser_id else None,
+            ("Initial Proxy IP", self.initial_proxy_ip) if self.initial_proxy_ip else None,
+            ("Latest Proxy IP", self.latest_proxy_ip) if self.latest_proxy_ip else None,
+            ("IP Changed Mid-session", "Yes" if self.ip_changed_mid_session else "No"),
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
             ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
             ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),

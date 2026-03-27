@@ -32,7 +32,7 @@ except ImportError:
 from config_reader import config
 from geolocation_db import GeolocationDB
 from logger import logger
-from proxy import get_proxies
+from proxy import get_proxies, parse_proxy_value
 
 
 class Direction(Enum):
@@ -142,7 +142,14 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
     :returns: (latitude, longitude, country_code, timezone) tuple for the given proxy IP
     """
 
-    proxies_header = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+    try:
+        parsed_proxy = parse_proxy_value(proxy)
+        proxy_url = parsed_proxy.proxy_url
+    except Exception:
+        proxy_url = f"http://{proxy}"
+        parsed_proxy = None
+
+    proxies_header = {"http": proxy_url, "https": proxy_url}
 
     ip_address = ""
 
@@ -200,7 +207,10 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
 
             sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
     else:
-        ip_address = proxy.split(":")[0]
+        if parsed_proxy:
+            ip_address = parsed_proxy.host
+        else:
+            ip_address = proxy.split(":")[0]
 
     if not ip_address:
         logger.info(f"Couldn't verify IP address for {proxy}!")
@@ -322,6 +332,40 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
             return (None, None, None, None)
 
 
+def get_proxy_exit_ip(proxy: str, *, max_retries: int = 1, retry_sleep_seconds: float = 1.5) -> Optional[str]:
+    """Resolve the current public exit IP for a proxy using lightweight endpoints."""
+
+    if not proxy:
+        return None
+
+    try:
+        proxy_url = parse_proxy_value(proxy).proxy_url
+    except ValueError:
+        proxy_url = f"http://{proxy}"
+
+    proxies_header = {"http": proxy_url, "https": proxy_url}
+    endpoints: list[tuple[str, Callable[[requests.Response], Optional[str]]]] = [
+        ("https://api.ipify.org", lambda response: response.text.strip()),
+        ("https://ipv4.webshare.io/", lambda response: response.text.strip()),
+        ("https://ipconfig.io/json", lambda response: response.json().get("ip")),
+    ]
+
+    for attempt_index in range(max(1, max_retries)):
+        for endpoint, extractor in endpoints:
+            try:
+                response = requests.get(endpoint, proxies=proxies_header, timeout=5)
+                ip_address = extractor(response)
+                if ip_address:
+                    return str(ip_address).strip()
+            except Exception as exp:
+                logger.debug(f"Proxy exit IP lookup failed via {endpoint}: {exp}")
+
+        if attempt_index + 1 < max(1, max_retries):
+            sleep(retry_sleep_seconds * config.behavior.wait_factor)
+
+    return None
+
+
 def get_queries() -> list[str]:
     """Get queries from file
 
@@ -367,11 +411,22 @@ def get_domains() -> list[str]:
 
 
 def get_ad_allowlist_domains() -> list[str]:
-    return _get_optional_domains(Path(config.paths.ad_allowlist), "Ad allowlist")
+    domains = _get_optional_domains(Path(config.paths.ad_allowlist), "Ad allowlist")
+    if not domains:
+        logger.debug(
+            "Ad allowlist mode: disabled "
+            "(all domains are eligible except those blocked by the denylist)."
+        )
+    return domains
 
 
 def get_ad_denylist_domains() -> list[str]:
-    return _get_optional_domains(Path(config.paths.ad_denylist), "Ad denylist")
+    domains = _get_optional_domains(Path(config.paths.ad_denylist), "Ad denylist")
+    if domains:
+        logger.debug(f"Ad denylist mode: active ({len(domains)} blocked domains).")
+    else:
+        logger.debug("Ad denylist mode: disabled (no blocked domains configured).")
+    return domains
 
 
 def _get_optional_domains(filepath: Path, label: str) -> list[str]:
@@ -499,29 +554,19 @@ def solve_recaptcha(
     def _parse_proxy(proxy_value: str) -> Optional[dict[str, Any]]:
         if not proxy_value:
             return None
-        if "@" in proxy_value:
-            creds, host_port = proxy_value.split("@", 1)
-            if ":" not in creds or ":" not in host_port:
-                return None
-            login, password = creds.split(":", 1)
-            host, port = host_port.rsplit(":", 1)
-            if not port.isdigit():
-                return None
-            return {
-                "proxyType": "http",
-                "proxyAddress": host,
-                "proxyPort": int(port),
-                "proxyLogin": login,
-                "proxyPassword": password,
-            }
-        host, port = proxy_value.rsplit(":", 1)
-        if not port.isdigit():
+        try:
+            parsed_proxy = parse_proxy_value(proxy_value)
+        except ValueError:
             return None
-        return {
+        proxy_config = {
             "proxyType": "http",
-            "proxyAddress": host,
-            "proxyPort": int(port),
+            "proxyAddress": parsed_proxy.host,
+            "proxyPort": parsed_proxy.port,
         }
+        if parsed_proxy.has_auth:
+            proxy_config["proxyLogin"] = parsed_proxy.username
+            proxy_config["proxyPassword"] = parsed_proxy.password
+        return proxy_config
 
     attempts: list[tuple[str, dict[str, Any]]] = []
     proxy_cfg = _parse_proxy(proxy or "")
@@ -556,27 +601,43 @@ def solve_recaptcha(
 
         while create_retry_count < max_retry_count:
             try:
+                logger.info(
+                    "2captcha createTask started "
+                    f"({task_label}) attempt={create_retry_count + 1}/{max_retry_count}"
+                )
                 response = requests.post(create_task_url, json=create_payload, timeout=request_timeout)
                 response_data = response.json()
                 logger.debug(f"2captcha createTask response ({task_label}): {response_data}")
             except Exception as exp:
                 create_retry_count += 1
-                logger.error(f"Failed to call 2captcha createTask ({task_label}): {exp}")
+                logger.error(
+                    "2captcha createTask failed before usable response "
+                    f"({task_label}) attempt={create_retry_count}/{max_retry_count}: {exp}"
+                )
                 sleep(5 * config.behavior.wait_factor)
                 continue
 
             error_to_exit, error_to_continue = _check_2captcha_v2_error(response_data, "createTask")
             if error_to_exit:
+                logger.error(f"2captcha createTask exited with unrecoverable error ({task_label}).")
                 return None
             if error_to_continue:
+                logger.warning(
+                    "2captcha createTask returned retryable error "
+                    f"({task_label}) attempt={create_retry_count + 1}/{max_retry_count}"
+                )
                 create_retry_count += 1
                 continue
 
             task_id = response_data.get("taskId")
             if task_id:
-                logger.debug(f"2captcha task_id ({task_label}): {task_id}")
+                logger.info(f"2captcha createTask succeeded ({task_label}) taskId={task_id}")
                 break
             create_retry_count += 1
+            logger.warning(
+                "2captcha createTask returned no taskId "
+                f"({task_label}) attempt={create_retry_count}/{max_retry_count}"
+            )
             sleep(5 * config.behavior.wait_factor)
 
         if not task_id:
@@ -587,6 +648,10 @@ def solve_recaptcha(
         poll_payload = {"clientKey": apikey, "taskId": task_id}
         poll_retry_count = 0
         poll_deadline = time.monotonic() + max_poll_seconds
+        logger.info(
+            f"2captcha getTaskResult polling started ({task_label}) "
+            f"taskId={task_id} timeout={max_poll_seconds}s"
+        )
         while poll_retry_count < max_retry_count and time.monotonic() < poll_deadline:
             try:
                 response = requests.post(
@@ -596,7 +661,10 @@ def solve_recaptcha(
                 logger.debug(f"2captcha getTaskResult ({task_label}): {response_data}")
             except Exception as exp:
                 poll_retry_count += 1
-                logger.error(f"Failed to call 2captcha getTaskResult ({task_label}): {exp}")
+                logger.error(
+                    "2captcha getTaskResult failed before usable response "
+                    f"({task_label}) taskId={task_id} attempt={poll_retry_count}/{max_retry_count}: {exp}"
+                )
                 sleep(5 * config.behavior.wait_factor)
                 continue
 
@@ -611,8 +679,15 @@ def solve_recaptcha(
                 response_data, "getTaskResult"
             )
             if error_to_exit:
+                logger.error(
+                    f"2captcha getTaskResult exited with unrecoverable error ({task_label}) taskId={task_id}."
+                )
                 return None
             if error_to_continue:
+                logger.warning(
+                    "2captcha getTaskResult returned retryable error "
+                    f"({task_label}) taskId={task_id} attempt={poll_retry_count + 1}/{max_retry_count}"
+                )
                 poll_retry_count += 1
                 continue
             if poll_status == "processing":
@@ -624,6 +699,10 @@ def solve_recaptcha(
             if poll_status == "ready":
                 solution = response_data.get("solution", {})
                 token = solution.get("gRecaptchaResponse") or solution.get("token")
+                logger.info(
+                    f"2captcha getTaskResult returned ready ({task_label}) taskId={task_id} "
+                    f"has_token={bool(token)}"
+                )
                 return str(token) if token else None
             poll_retry_count += 1
             sleep(5 * config.behavior.wait_factor)
@@ -843,12 +922,20 @@ def _make_boost_request(url: str, proxy: str, user_agent: str) -> None:
     """
 
     headers = {"User-Agent": user_agent}
-    proxy_config = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+    try:
+        proxy_url = parse_proxy_value(proxy).proxy_url
+    except ValueError:
+        proxy_url = f"http://{proxy}"
+    proxy_config = {"http": proxy_url, "https": proxy_url}
 
     try:
         response = requests.get(url, headers=headers, proxies=proxy_config, timeout=5)
+        try:
+            proxy_label = parse_proxy_value(proxy).host_port if proxy else proxy
+        except ValueError:
+            proxy_label = proxy
         logger.debug(
-            f"Boosted [{url}] via [{proxy.split('@')[1] if '@' in proxy else proxy}] "
+            f"Boosted [{url}] via [{proxy_label}] "
             f"UA={headers['User-Agent']}, Response code: {response.status_code}"
         )
 

@@ -43,7 +43,12 @@ else:
 from config_reader import config
 from geolocation_db import GeolocationDB
 from logger import logger
-from proxy import install_plugin
+from proxy import (
+    apply_iproyal_sticky_session,
+    extract_proxy_session_id,
+    install_plugin,
+    parse_proxy_value,
+)
 from utils import get_location, get_locale_language, get_random_sleep
 
 
@@ -53,37 +58,18 @@ IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
 def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
     """Pin IPRoyal residential proxies to a sticky session for one browser run."""
 
-    if not proxy or "@" not in proxy:
-        return proxy
-
-    creds, host_port = proxy.split("@", 1)
-    if ":" not in creds:
-        return proxy
-
-    username, password = creds.split(":", 1)
-    if "iproyal.com" not in host_port.lower():
-        return proxy
-    if "_session-" in password:
-        return proxy
-
-    session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    sticky_password = f"{password}_session-{session_id}_lifetime-{lifetime}"
-    sticky_proxy = f"{username}:{sticky_password}@{host_port}"
-    logger.debug(
-        "Applied sticky proxy session for browser run: "
-        f"host={host_port}, session_id={session_id}, lifetime={lifetime}"
-    )
-    return sticky_proxy
+    return apply_iproyal_sticky_session(proxy, lifetime=lifetime)
 
 
 def _extract_proxy_session_id(proxy: str) -> Optional[str]:
-    if not proxy or "_session-" not in proxy:
-        return None
-    try:
-        segment = proxy.split("_session-", 1)[1]
-        return segment.split("_", 1)[0]
-    except Exception:
-        return None
+    return extract_proxy_session_id(proxy)
+
+
+def _parse_proxy_components(proxy: str) -> tuple[str, str, str, str]:
+    """Support both user:pass@host:port and host:port:user:pass formats."""
+
+    parsed = parse_proxy_value(proxy)
+    return parsed.username, parsed.password, parsed.host, str(parsed.port)
 
 
 def _infer_country_code_from_proxy(proxy: str) -> Optional[str]:
@@ -279,7 +265,7 @@ def create_webdriver(
     """Create Selenium Chrome webdriver instance
 
     :type proxy: str
-    :param proxy: Proxy to use in ip:port or user:pass@host:port format
+    :param proxy: Proxy to use in ip:port, user:pass@host:port, or host:port:user:pass format
     :type user_agent: str
     :param user_agent: User agent string
     :type plugin_folder_name: str
@@ -371,13 +357,7 @@ def create_webdriver(
     browser_binary_path = _get_browser_binary_path()
     if proxy:
         if config.webdriver.auth:
-            if "@" not in proxy or proxy.count(":") != 2:
-                raise ValueError(
-                    "Invalid proxy format! Should be in 'username:password@host:port' format"
-                )
-
-            username, password = proxy.split("@")[0].split(":")
-            host, port = proxy.split("@")[1].split(":")
+            username, password, host, port = _parse_proxy_components(proxy)
 
             masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
             masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
@@ -439,9 +419,11 @@ def create_webdriver(
 
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
 
-            logger.debug(
-                f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
-            )
+            try:
+                timezone_proxy_label = parse_proxy_value(proxy).host_port
+            except Exception:
+                timezone_proxy_label = proxy
+            logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
         driver._active_proxy = proxy
 
     else:
@@ -481,7 +463,7 @@ def create_seleniumbase_driver(
     """Create SeleniumBase Chrome webdriver instance
 
     :type proxy: str
-    :param proxy: Proxy to use in ip:port or user:pass@host:port format
+    :param proxy: Proxy to use in ip:port, user:pass@host:port, or host:port:user:pass format
     :type user_agent: str
     :param user_agent: User agent string
     :rtype: tuple
@@ -497,13 +479,7 @@ def create_seleniumbase_driver(
 
     if proxy:
         if config.webdriver.auth:
-            if "@" not in proxy or proxy.count(":") != 2:
-                raise ValueError(
-                    "Invalid proxy format! Should be in 'username:password@host:port' format"
-                )
-
-            username, password = proxy.split("@")[0].split(":")
-            host, port = proxy.split("@")[1].split(":")
+            username, password, host, port = _parse_proxy_components(proxy)
 
             masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
             masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
@@ -555,9 +531,11 @@ def create_seleniumbase_driver(
             driver._custom_timezone = timezone
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
 
-            logger.debug(
-                f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
-            )
+            try:
+                timezone_proxy_label = parse_proxy_value(proxy).host_port
+            except Exception:
+                timezone_proxy_label = proxy
+            logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
         except Exception as exp:
             logger.debug(f"Skipping SeleniumBase CDP geo/timezone override: {exp}")
     driver._active_proxy = proxy if proxy else None

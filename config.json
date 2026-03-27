@@ -1,17 +1,14 @@
 {
     "paths": {
-        "query_file": "",
+        "query_file": "queries.txt",
         "proxy_file": "proxies.txt",
         "user_agents": "user_agents.txt",
-        "filtered_domains": "domains.txt",
-        "ad_allowlist": "ad_allowlist.txt",
-        "ad_denylist": "ad_denylist.txt"
+        "filtered_domains": "domains.txt"
     },
     "webdriver": {
         "proxy": "",
         "auth": true,
         "incognito": false,
-        "identity_mode": "native_linux",
         "country_domain": true,
         "language_from_proxy": true,
         "ss_on_exception": false,
@@ -20,7 +17,7 @@
         "use_seleniumbase": false
     },
     "behavior": {
-        "query": "desentupidora porto alegre",
+        "query": "",
         "ad_page_min_wait": 10,
         "ad_page_max_wait": 15,
         "nonad_page_min_wait": 15,
@@ -41,10 +38,6 @@
         "hooks_enabled": false,
         "telegram_enabled": false,
         "send_to_android": false,
-        "request_boost": false,
-        "no_clickable_ads_retry_probability": 0.7,
-        "no_clickable_ads_exit_probability": 0.3,
-        "no_clickable_ads_max_retries": 1,
-        "enable_v2_enterprise_fallback": false
+        "request_boost": false
     }
 }

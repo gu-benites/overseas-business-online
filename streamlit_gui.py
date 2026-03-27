@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +20,17 @@ try:
 except Exception:
     OpenAI = None
 
+from groups_db import GroupsDB
+
 
 ROOT = Path.cwd()
 load_dotenv(ROOT / ".env")
 CONFIG_PATH = ROOT / "config.json"
 LOG_DIR = ROOT / ".streamlit_logs"
+GROUPS_DB_PATH = ROOT / "groups.db"
+
+GROUP_AI_JOBS: dict[int, dict[str, Any]] = {}
+GROUP_AI_JOBS_LOCK = threading.Lock()
 
 
 REQUIRED_FIELDS = {
@@ -293,6 +300,8 @@ def generate_keywords_with_openai(seed_query: str, model: str) -> dict[str, Any]
         "The second keyword must be exactly: 'desentupidora em <cidade>' (with inferred city). "
         "Keywords 3-10 must remain focused on the same inferred city (never switch to other cities), "
         "while varying naturally and prioritizing the best estimated volume/CPC opportunities relevant to desentupidora services. "
+        "Every keyword must contain the word 'desentupidora'. "
+        "Do not generate terms about limpeza de fossa, limpa fossa, limpeza de caixa de agua, caixa d'agua, dedetizacao, encanador, or any service outside desentupidora intent. "
         "Do not use external tools; provide realistic estimates and concise rationale."
     )
     user_prompt = (
@@ -301,6 +310,8 @@ def generate_keywords_with_openai(seed_query: str, model: str) -> dict[str, Any]
         "Constraint: keywords[0].term = 'desentupidora <cidade>' and keywords[1].term = 'desentupidora em <cidade>', "
         "replacing <cidade> with the inferred city from the seed query. "
         "For keywords[2]..keywords[9], use free high-volume/high-CPC variations but keep the same inferred city and do not introduce other cities. "
+        "All 10 terms must contain the word 'desentupidora'. "
+        "Never use terms such as 'limpeza de fossa', 'limpa fossa', 'limpeza de caixa de agua', 'caixa d'agua', or similar non-desentupidora services. "
         "Do not output '<cidade>' literally. "
         "Market: Brazil. Language: pt-BR. Currency: BRL."
     )
@@ -332,14 +343,68 @@ def generate_keywords_with_openai(seed_query: str, model: str) -> dict[str, Any]
     return payload
 
 
+def _start_group_keyword_job(group_id: int, city_name: str, model: str) -> None:
+    seed_query = f"desentupidora {city_name}"
+
+    with GROUP_AI_JOBS_LOCK:
+        current = GROUP_AI_JOBS.get(group_id)
+        if current and current.get("status") == "running":
+            return
+        GROUP_AI_JOBS[group_id] = {
+            "status": "running",
+            "seed_query": seed_query,
+            "model": model,
+            "error": None,
+        }
+
+    def _runner() -> None:
+        try:
+            payload = generate_keywords_with_openai(seed_query, model)
+            keywords = payload.get("keywords", [])
+            terms = [
+                to_text(item.get("term", "")).strip()
+                for item in keywords
+                if to_text(item.get("term", "")).strip()
+            ]
+            GroupsDB(GROUPS_DB_PATH).replace_group_queries(group_id, terms)
+            with GROUP_AI_JOBS_LOCK:
+                GROUP_AI_JOBS[group_id] = {
+                    "status": "completed",
+                    "seed_query": seed_query,
+                    "model": model,
+                    "error": None,
+                    "terms": terms,
+                }
+        except Exception as exc:
+            with GROUP_AI_JOBS_LOCK:
+                GROUP_AI_JOBS[group_id] = {
+                    "status": "error",
+                    "seed_query": seed_query,
+                    "model": model,
+                    "error": str(exc),
+                }
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+
+def _get_group_keyword_job(group_id: int) -> dict[str, Any] | None:
+    with GROUP_AI_JOBS_LOCK:
+        job = GROUP_AI_JOBS.get(group_id)
+        return dict(job) if job else None
+
+
 st.set_page_config(page_title="Google Ad Clicker Dashboard", layout="wide")
 
 
 if "jobs" not in st.session_state:
     st.session_state["jobs"] = {}
+if "active_group_id" not in st.session_state:
+    st.session_state["active_group_id"] = None
 
 
 config = load_config()
+groups_db = GroupsDB(GROUPS_DB_PATH)
 
 st.title("Google Ad Clicker Dashboard")
 st.caption("Desktop GUI parity: config editor and script launcher in the browser.")
@@ -540,8 +605,170 @@ if generated_payload:
             except Exception as exc:
                 st.error(f"Failed to write query_file: {exc}")
 
+st.subheader("Groups")
+st.caption("Crie grupos por cidade. A geração de queries com IA começa assim que o grupo é criado.")
+
+with st.form("create_group_form"):
+    new_group_city = st.text_input("Nome da Cidade", key="new_group_city")
+    create_group_submitted = st.form_submit_button("Criar grupo")
+    if create_group_submitted:
+        city_name = to_text(new_group_city).strip()
+        if not city_name:
+            st.error("Nome da Cidade é obrigatório.")
+        else:
+            try:
+                group_id = groups_db.create_group(city_name, rsw_id="", proxy="", enabled=True)
+                st.session_state["active_group_id"] = group_id
+                _start_group_keyword_job(group_id, city_name, selected_model)
+                st.success(
+                    f"Grupo '{city_name}' criado. A geração de queries foi iniciada em background."
+                )
+            except Exception as exc:
+                st.error(f"Falha ao criar grupo: {exc}")
+
+all_groups = groups_db.list_groups()
+if all_groups:
+    active_groups = [group for group in all_groups if group.enabled]
+    active_groups_with_proxy = [group for group in active_groups if to_text(group.proxy).strip()]
+    group_metrics_col_1, group_metrics_col_2, group_metrics_col_3 = st.columns(3)
+    with group_metrics_col_1:
+        st.metric("Grupos totais", len(all_groups))
+    with group_metrics_col_2:
+        st.metric("Grupos ativos", len(active_groups))
+    with group_metrics_col_3:
+        st.metric("Ativos com proxy", len(active_groups_with_proxy))
+
+    group_labels = {
+        group.id: f"{group.city_name} | rsw_id={group.rsw_id or '-'} | {'ativo' if group.enabled else 'inativo'}"
+        for group in all_groups
+    }
+    default_group_id = st.session_state.get("active_group_id")
+    if default_group_id not in group_labels:
+        default_group_id = all_groups[0].id
+
+    selected_group_id = st.selectbox(
+        "Selecionar grupo",
+        options=list(group_labels.keys()),
+        format_func=lambda group_id: group_labels[group_id],
+        index=list(group_labels.keys()).index(default_group_id),
+        key="selected_group_id",
+    )
+    st.session_state["active_group_id"] = selected_group_id
+    selected_group = groups_db.get_group(selected_group_id)
+    group_job = _get_group_keyword_job(selected_group_id)
+
+    status_col_1, status_col_2, status_col_3 = st.columns(3)
+    with status_col_1:
+        st.metric("Cidade", selected_group.city_name if selected_group else "-")
+    with status_col_2:
+        st.metric("RSW ID", selected_group.rsw_id if selected_group and selected_group.rsw_id else "-")
+    with status_col_3:
+        generation_status = group_job["status"] if group_job else "idle"
+        st.metric("IA Queries", generation_status)
+
+    if group_job:
+        if group_job["status"] == "running":
+            st.info(
+                f"Gerando queries para '{selected_group.city_name}' com seed "
+                f"'{group_job['seed_query']}'..."
+            )
+        elif group_job["status"] == "completed":
+            st.success("Queries do grupo geradas e salvas no SQLite.")
+        elif group_job["status"] == "error":
+            st.error(f"Falha na geração de queries: {group_job['error']}")
+
+    with st.form("edit_group_form"):
+        edit_city_name = st.text_input("Nome da Cidade", value=selected_group.city_name if selected_group else "")
+        edit_rsw_id = st.text_input("RSW ID", value=selected_group.rsw_id if selected_group else "")
+        edit_proxy = st.text_input("Proxy", value=selected_group.proxy if selected_group else "")
+        edit_enabled = st.checkbox("Ativo", value=selected_group.enabled if selected_group else True)
+        save_group_submitted = st.form_submit_button("Salvar grupo")
+        if save_group_submitted and selected_group:
+            try:
+                groups_db.update_group(
+                    selected_group.id,
+                    city_name=edit_city_name,
+                    rsw_id=edit_rsw_id,
+                    proxy=edit_proxy,
+                    enabled=edit_enabled,
+                )
+                st.success("Grupo salvo.")
+            except Exception as exc:
+                st.error(f"Falha ao salvar grupo: {exc}")
+
+    group_action_1, group_action_2 = st.columns(2)
+    with group_action_1:
+        if st.button("Regenerar queries com IA", key=f"regenerate_group_ai_{selected_group_id}"):
+            _start_group_keyword_job(selected_group_id, selected_group.city_name, selected_model)
+            st.info("Regeneração iniciada.")
+    with group_action_2:
+        if st.button("Atualizar status do grupo", key=f"refresh_group_{selected_group_id}"):
+            st.rerun()
+
+    group_queries = groups_db.get_group_queries(selected_group_id)
+    if group_queries:
+        st.caption("Queries salvas no SQLite para este grupo")
+        st.dataframe(
+            [{"position": query.position, "query_text": query.query_text} for query in group_queries],
+            use_container_width=True,
+        )
+    else:
+        st.caption("Nenhuma query salva ainda para este grupo.")
+
+    st.subheader("Grouped Runner")
+    st.caption(
+        "Executa a rotação dos grupos ativos do SQLite usando "
+        "`run_grouped_ad_clicker.py`."
+    )
+
+    runner_timer_col_1, runner_timer_col_2 = st.columns(2)
+    with runner_timer_col_1:
+        grouped_runner_timer_enabled = st.checkbox(
+            "Enable loop timer",
+            value=False,
+            key="grouped_runner_timer_enabled",
+        )
+    with runner_timer_col_2:
+        grouped_runner_timer_minutes = st.number_input(
+            "Loop duration (minutes)",
+            min_value=1,
+            value=60,
+            step=1,
+            disabled=not grouped_runner_timer_enabled,
+            key="grouped_runner_timer_minutes",
+        )
+
+    grouped_loop_args: list[str] = []
+    if grouped_runner_timer_enabled:
+        grouped_loop_args.extend(
+            ["--max-runtime-minutes", str(int(grouped_runner_timer_minutes))]
+        )
+
+    runner_col_1, runner_col_2, runner_col_3 = st.columns(3)
+    with runner_col_1:
+        if st.button("RUN active groups loop"):
+            start_process(
+                "run_grouped_ad_clicker.py",
+                extra_args=grouped_loop_args or None,
+                process_key="run_grouped_ad_clicker",
+            )
+    with runner_col_2:
+        if st.button("RUN active groups once"):
+            start_process(
+                "run_grouped_ad_clicker.py",
+                extra_args=["--once"],
+                process_key="run_grouped_ad_clicker_once",
+            )
+    with runner_col_3:
+        if st.button("RUN selected group once") and selected_group:
+            start_process(
+                "run_grouped_ad_clicker.py",
+                extra_args=["--once", "--group-city", selected_group.city_name],
+                process_key="run_grouped_ad_clicker_selected",
+            )
+
 st.subheader("Actions")
-action_1, action_2, action_3, action_4 = st.columns(4)
+action_1, action_2, action_3, action_4, action_5 = st.columns(5)
 with action_1:
     if st.button("RUN ad_clicker.py"):
         start_process("ad_clicker.py")
@@ -558,11 +785,18 @@ with action_4:
     if st.button("GENERATE CLICK REPORT"):
         start_process("ad_clicker.py", ["--report_clicks", "--excel"], process_key="report_clicks")
 
+with action_5:
+    if st.button("RUN run_grouped_ad_clicker.py"):
+        start_process("run_grouped_ad_clicker.py", process_key="run_grouped_ad_clicker")
+
 
 st.subheader("Running jobs")
 tracked_processes = [
     ("ad_clicker.py", "ad_clicker.py"),
     ("run_ad_clicker.py", "run_ad_clicker.py"),
+    ("run_grouped_ad_clicker.py", "grouped runner loop"),
+    ("run_grouped_ad_clicker.py", "grouped runner once"),
+    ("run_grouped_ad_clicker.py", "selected group once"),
     ("run_in_loop.py", "run_in_loop.py"),
     ("ad_clicker.py", "generate click report"),
 ]
@@ -570,6 +804,12 @@ tracked_processes = [
 for script, label in tracked_processes:
     if label == "generate click report":
         key = "report_clicks"
+    elif label == "grouped runner loop":
+        key = "run_grouped_ad_clicker"
+    elif label == "grouped runner once":
+        key = "run_grouped_ad_clicker_once"
+    elif label == "selected group once":
+        key = "run_grouped_ad_clicker_selected"
     else:
         key = Path(script).stem
     with st.container():

@@ -37,6 +37,7 @@ from utils import (
     domain_matches_url,
     get_ad_allowlist_domains,
     get_ad_denylist_domains,
+    get_proxy_exit_ip,
     solve_recaptcha,
     get_random_sleep,
     resolve_redirect,
@@ -132,6 +133,45 @@ class SearchController:
 
         self._load()
 
+    def _record_proxy_ip_checkpoint(self, stage: str, *, abort_on_change: bool = True) -> None:
+        active_proxy = getattr(self._driver, "_active_proxy", None)
+        if not active_proxy:
+            return
+
+        current_proxy_ip = get_proxy_exit_ip(active_proxy, max_retries=1, retry_sleep_seconds=1)
+        if not current_proxy_ip:
+            logger.warning(f"Proxy IP checkpoint failed at stage={stage}.")
+            return
+
+        if not self._stats.initial_proxy_ip:
+            self._stats.initial_proxy_ip = current_proxy_ip
+            self._stats.latest_proxy_ip = current_proxy_ip
+            logger.info(
+                f"Proxy IP checkpoint [{stage}]: initial exit IP set to {current_proxy_ip}"
+            )
+            return
+
+        previous_proxy_ip = self._stats.latest_proxy_ip or self._stats.initial_proxy_ip
+        self._stats.latest_proxy_ip = current_proxy_ip
+        logger.info(
+            f"Proxy IP checkpoint [{stage}]: current={current_proxy_ip}, previous={previous_proxy_ip}"
+        )
+
+        if current_proxy_ip == self._stats.initial_proxy_ip:
+            return
+
+        self._stats.ip_changed_mid_session = True
+        logger.error(
+            "Proxy exit IP changed mid-session: "
+            f"initial={self._stats.initial_proxy_ip}, current={current_proxy_ip}, stage={stage}"
+        )
+        self._save_step_screenshot(f"{stage}_ip_changed")
+
+        if abort_on_change:
+            logger.info("Stopping run because proxy exit IP changed mid-session.")
+            self._driver.quit()
+            raise SystemExit()
+
     def search_for_ads(
         self, non_ad_domains: Optional[list[str]] = None
     ) -> tuple[AdList, NonAdList]:
@@ -160,6 +200,7 @@ class SearchController:
         self._ensure_browser_session_alive("after_cookie_dialog")
         self._wait_for_page_settle()
         self._ensure_browser_session_alive("after_second_settle")
+        self._record_proxy_ip_checkpoint("session_start")
         self._check_captcha()
         self._abort_if_google_blocked("search_start")
 
@@ -1299,6 +1340,7 @@ class SearchController:
                     hooks.captcha_seen_hook(self._driver)
 
                 self._stats.captcha_seen = True
+                self._record_proxy_ip_checkpoint("captcha_seen")
 
                 if not self._twocaptcha_apikey:
                     logger.info("Please try with a different proxy or enable 2captcha service.")
@@ -1360,6 +1402,7 @@ class SearchController:
                         self._apply_captcha_solution(response_code)
                         self._stats.captcha_token_applied = True
                         logger.info("Captcha token was applied to the page.")
+                        self._record_proxy_ip_checkpoint("post_captcha_token_applied")
 
                         sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
                         self._save_step_screenshot("captcha_after_solve")

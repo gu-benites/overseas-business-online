@@ -1,7 +1,3 @@
 # One domain per line.
 # If this file has entries, only ads whose target domain matches one of them will be clicked.
-desentupidorarsw.com.br
-desentupidorasousa.com.br
-desentupidorafgs.com.br
-zebostinha.com.br
-kombosta.com.br
+

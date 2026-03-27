@@ -2,7 +2,9 @@ import random
 import shutil
 import string
 import traceback
+import json
 from argparse import ArgumentParser
+from dataclasses import asdict
 from datetime import datetime
 from itertools import chain, filterfalse, zip_longest
 from pathlib import Path
@@ -78,7 +80,10 @@ def get_arg_parser() -> ArgumentParser:
     arg_parser.add_argument(
         "-p",
         "--proxy",
-        help="""Use the given proxy in "ip:port" or "username:password@host:port" format""",
+        help=(
+            'Use the given proxy in "ip:port", "username:password@host:port", '
+            'or "host:port:username:password" format'
+        ),
     )
     arg_parser.add_argument("--id", help="Browser id for multiprocess run")
     arg_parser.add_argument(
@@ -93,6 +98,11 @@ def get_arg_parser() -> ArgumentParser:
         "--check_stealth", action="store_true", help="Check stealth for undetection"
     )
     arg_parser.add_argument("-d", "--device_id", help="Android device ID for assigning to browser")
+    arg_parser.add_argument(
+        "--json-summary",
+        action="store_true",
+        help="Print machine-readable run summary for automation consumers",
+    )
 
     return arg_parser
 
@@ -179,6 +189,7 @@ def main():
     driver = None
     country_code = None
     search_controller = None
+    json_summary_emitted = False
 
     try:
         driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
@@ -282,6 +293,13 @@ def main():
                 notify_matching_ads(current_query, links=ads + shopping_ads, stats=search_controller.stats)
 
             logger.info(search_controller.stats)
+            if args.json_summary:
+                print(
+                    "JSON_SUMMARY:"
+                    + json.dumps(asdict(search_controller.stats), ensure_ascii=False),
+                    flush=True,
+                )
+                json_summary_emitted = True
             break
 
     except Exception as exp:
@@ -302,6 +320,13 @@ def main():
 
     finally:
         if search_controller:
+            if args.json_summary and not json_summary_emitted:
+                print(
+                    "JSON_SUMMARY:"
+                    + json.dumps(asdict(search_controller.stats), ensure_ascii=False),
+                    flush=True,
+                )
+
             if config.behavior.hooks_enabled:
                 hooks.before_browser_close_hook(driver)
 
