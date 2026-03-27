@@ -494,6 +494,12 @@ with st.expander("Settings", expanded=True):
             min_value=1,
             value=to_int(behavior.get("max_concurrent_groups"), 1),
         )
+        concurrent_group_launch_stagger_seconds = st.number_input(
+            "Concurrent group launch stagger (seconds)",
+            min_value=0.0,
+            value=float(to_float(behavior.get("concurrent_group_launch_stagger_seconds"), 8.0)),
+            step=1.0,
+        )
         wait_factor = st.number_input(
             "Wait factor",
             min_value=0.1,
@@ -555,6 +561,9 @@ with st.expander("Settings", expanded=True):
                 "multiprocess_style": multiprocess_style,
                 "loop_wait_time": loop_wait_time,
                 "max_concurrent_groups": max_concurrent_groups,
+                "concurrent_group_launch_stagger_seconds": to_float(
+                    concurrent_group_launch_stagger_seconds, 8.0
+                ),
                 "wait_factor": to_float(wait_factor, 1.0),
                 "running_interval_start": running_interval_start,
                 "running_interval_end": running_interval_end,
@@ -752,10 +761,21 @@ if all_groups:
         step=1,
         key="grouped_runner_max_concurrent_groups",
     )
+    grouped_runner_launch_stagger_seconds = st.number_input(
+        "Grouped runner launch stagger (seconds)",
+        min_value=0.0,
+        max_value=60.0,
+        value=float(to_float(behavior.get("concurrent_group_launch_stagger_seconds"), 8.0)),
+        step=1.0,
+        key="grouped_runner_launch_stagger_seconds",
+    )
 
     grouped_loop_args: list[str] = []
     grouped_loop_args.extend(
         ["--max-concurrent-groups", str(int(grouped_runner_concurrency))]
+    )
+    grouped_loop_args.extend(
+        ["--launch-stagger-seconds", str(float(grouped_runner_launch_stagger_seconds))]
     )
     if grouped_runner_timer_enabled:
         grouped_loop_args.extend(
@@ -774,7 +794,13 @@ if all_groups:
         if st.button("RUN active groups once"):
             start_process(
                 "run_grouped_ad_clicker.py",
-                extra_args=["--once", "--max-concurrent-groups", str(int(grouped_runner_concurrency))],
+                extra_args=[
+                    "--once",
+                    "--max-concurrent-groups",
+                    str(int(grouped_runner_concurrency)),
+                    "--launch-stagger-seconds",
+                    str(float(grouped_runner_launch_stagger_seconds)),
+                ],
                 process_key="run_grouped_ad_clicker_once",
             )
     with runner_col_3:
@@ -787,6 +813,8 @@ if all_groups:
                     selected_group.city_name,
                     "--max-concurrent-groups",
                     str(int(grouped_runner_concurrency)),
+                    "--launch-stagger-seconds",
+                    str(float(grouped_runner_launch_stagger_seconds)),
                 ],
                 process_key="run_grouped_ad_clicker_selected",
             )

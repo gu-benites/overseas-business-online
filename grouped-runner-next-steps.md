@@ -722,3 +722,126 @@ Observação operacional:
 - isso foi implementado para permitir o próximo passo de escala
 - ainda falta validação longa de estabilidade com `2` concorrências reais em produção
 - se houver aumento de swap, crashes de Chromium ou falhas de túnel, o fallback recomendado continua sendo voltar para `1`
+
+### Stagger de launch para concorrência
+
+Depois da primeira validação com `2` concorrências, apareceu um padrão operacional importante:
+
+- o orquestrador conseguia rodar `2` grupos em paralelo
+- porém vários grupos falhavam cedo com erro de startup do Chrome/UC, como:
+  - `session not created: cannot connect to chrome at 127.0.0.1:<port>`
+
+Para reduzir colisão no startup paralelo, foi implementado um stagger configurável entre os launches concorrentes.
+
+Capacidades novas:
+
+- config:
+  - `behavior.concurrent_group_launch_stagger_seconds`
+- CLI:
+  - `--launch-stagger-seconds <N>`
+- Streamlit:
+  - `Grouped runner launch stagger (seconds)`
+
+Estado atual padrão:
+
+- `concurrent_group_launch_stagger_seconds = 8.0`
+
+Comportamento:
+
+- quando `max_concurrent_groups > 1`
+- o runner espera `N` segundos entre submeter um grupo concorrente e o próximo
+- isso reduz a chance de dois Chromes/UC iniciarem exatamente no mesmo instante
+
+Objetivo:
+
+- manter `2` concorrências
+- mas diminuir falhas precoces de criação de sessão do browser
+
+## Medição real com `max_concurrent_groups = 2`
+
+Foi feita uma medição com o Streamlit ativo e o grouped runner iniciado pela UI com:
+
+- `grouped runner loop: running`
+- `--max-concurrent-groups 2`
+
+Estado observado do runner:
+
+- PID do grouped runner:
+  - `2650393`
+- `2` workers `ad_clicker.py` ativos ao mesmo tempo:
+  - `Belo Horizonte`
+  - `Bauru`
+
+### CPU
+
+Métricas observadas:
+
+- VPS:
+  - `2 vCPUs`
+- load average:
+  - `0.92 / 0.70 / 0.83`
+- no `vmstat`, houve folga relevante:
+  - `idle` ainda em torno de `65%`
+- árvore do grouped runner + 2 browsers:
+  - `TOTAL_CPU_PERCENT 63.1`
+
+Leitura prática:
+
+- com `2` concorrências, CPU continua aceitável
+- CPU não apareceu como gargalo principal neste teste
+
+### Memória
+
+Métricas observadas:
+
+- RAM total:
+  - `3.7 GiB`
+- memória disponível:
+  - cerca de `1.0 GiB`
+- memória livre:
+  - cerca de `113 MiB`
+- swap em uso:
+  - cerca de `2.0 GiB`
+
+Árvore do grouped runner:
+
+- `TOTAL_RSS_KB 2038024`
+- aproximadamente `1.94 GiB RSS`
+
+Leitura prática:
+
+- `2` concorrências funcionam no VPS atual
+- mas ainda deixam a máquina apertada em memória
+- o sistema continua apoiado em swap
+- o gargalo principal segue sendo memória, não CPU
+
+### Conclusão operacional atual
+
+- `1` concorrência:
+  - modo mais estável
+- `2` concorrências:
+  - aceitável e operacional no VPS atual
+  - melhor teto prático atual
+- `3` ou mais:
+  - continuam não recomendadas neste VPS
+
+Conclusão direta:
+
+- o cleanup automático de browsers órfãos ajudou
+- o VPS agora consegue sustentar `2` concorrências reais
+- ainda não há margem saudável para subir além disso
+
+## Tratamento de interrupção manual
+
+Foi observado anteriormente um traceback com `KeyboardInterrupt` enquanto o runner aguardava um `subprocess.run(...)` de um grupo.
+
+Leitura correta desse caso:
+
+- não era falha do fluxo de rotação do grupo em si
+- era uma interrupção externa/manual do processo do grouped runner
+
+O runner foi ajustado para tratar isso de forma limpa:
+
+- agora, em caso de `KeyboardInterrupt`, ele registra:
+  - `Grouped runner interrupted by user. Stopping cleanly.`
+- e evita despejar traceback feio no log como se fosse erro operacional do ciclo

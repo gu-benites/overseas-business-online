@@ -32,6 +32,11 @@ def get_arg_parser() -> argparse.ArgumentParser:
         help="Run up to N groups concurrently in each cycle",
     )
     parser.add_argument(
+        "--launch-stagger-seconds",
+        type=float,
+        help="Wait this many seconds between concurrent group launches",
+    )
+    parser.add_argument(
         "--max-runtime-minutes",
         type=float,
         help="Stop the continuous loop after the given runtime in minutes",
@@ -302,6 +307,19 @@ def _resolve_max_concurrent_groups(cli_value: int | None) -> int:
     return max(1, value)
 
 
+def _resolve_concurrent_launch_stagger_seconds(cli_value: float | None) -> float:
+    configured = (
+        cli_value
+        if cli_value is not None
+        else config.behavior.concurrent_group_launch_stagger_seconds
+    )
+    try:
+        value = float(configured or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return max(0.0, value)
+
+
 def _iter_target_groups(db: GroupsDB, group_city: str | None) -> list[GroupRecord]:
     groups = db.list_groups(enabled_only=True)
     if not group_city:
@@ -352,10 +370,16 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
         return False
 
     max_concurrent_groups = _resolve_max_concurrent_groups(None)
+    launch_stagger_seconds = _resolve_concurrent_launch_stagger_seconds(None)
     logger.info(
         "Grouped runner concurrency limit: "
         f"{max_concurrent_groups} group(s) per cycle."
     )
+    if max_concurrent_groups > 1:
+        logger.info(
+            "Grouped runner launch stagger: "
+            f"{launch_stagger_seconds:.1f} second(s) between concurrent submissions."
+        )
 
     for group, query in planned:
         _log_planned_group(group, query)
@@ -370,9 +394,15 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_concurrent_groups) as executor:
-        for group, query in planned:
+        for index, (group, query) in enumerate(planned):
             _cleanup_orphan_browsers()
             futures.append(executor.submit(_run_group_once, db, group, query))
+            if index < len(planned) - 1 and launch_stagger_seconds > 0:
+                logger.debug(
+                    "Waiting before launching next concurrent group: "
+                    f"{launch_stagger_seconds:.1f} second(s)."
+                )
+                sleep(launch_stagger_seconds)
         for future in as_completed(futures):
             future.result()
     return True
@@ -383,7 +413,11 @@ def main() -> None:
     db = GroupsDB()
     deadline = None
     resolved_max_concurrent_groups = _resolve_max_concurrent_groups(args.max_concurrent_groups)
+    resolved_launch_stagger_seconds = _resolve_concurrent_launch_stagger_seconds(
+        args.launch_stagger_seconds
+    )
     config.behavior.max_concurrent_groups = resolved_max_concurrent_groups
+    config.behavior.concurrent_group_launch_stagger_seconds = resolved_launch_stagger_seconds
 
     if args.max_runtime_minutes and args.max_runtime_minutes > 0:
         deadline = monotonic() + (args.max_runtime_minutes * 60)
@@ -394,6 +428,10 @@ def main() -> None:
     logger.info(
         "Grouped runner concurrency configured: "
         f"{resolved_max_concurrent_groups} group(s)."
+    )
+    logger.info(
+        "Grouped runner launch stagger configured: "
+        f"{resolved_launch_stagger_seconds:.1f} second(s)."
     )
 
     while True:
@@ -420,6 +458,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        logger.warning("Grouped runner interrupted by user. Stopping cleanly.")
     except Exception as exp:
         logger.error("Exception occurred. See the details in the log file.")
         message = str(exp).split("\n")[0]

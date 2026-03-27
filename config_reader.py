@@ -47,6 +47,7 @@ class BehaviorParams:
     multiprocess_style: Optional[int] = 1
     loop_wait_time: Optional[int] = 60
     max_concurrent_groups: Optional[int] = 1
+    concurrent_group_launch_stagger_seconds: Optional[float] = 8.0
     wait_factor: Optional[float] = 1.0
     running_interval_start: Optional[str] = ""
     running_interval_end: Optional[str] = ""
@@ -127,6 +128,9 @@ class ConfigReader:
             multiprocess_style=config["behavior"]["multiprocess_style"],
             loop_wait_time=config["behavior"]["loop_wait_time"],
             max_concurrent_groups=config["behavior"].get("max_concurrent_groups", 1),
+            concurrent_group_launch_stagger_seconds=config["behavior"].get(
+                "concurrent_group_launch_stagger_seconds", 8.0
+            ),
             wait_factor=config["behavior"]["wait_factor"],
             running_interval_start=config["behavior"]["running_interval_start"],
             running_interval_end=config["behavior"]["running_interval_end"],
