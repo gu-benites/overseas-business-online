@@ -509,6 +509,31 @@ Também foi adicionado timer opcional para o loop contínuo:
 - parar os jobs pela própria UI
 - acompanhar logs recentes do runner agrupado pela UI
 
+### Log de cliques por execução
+
+Agora cada execução do [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py)
+gera um arquivo dedicado com timestamp no nome em:
+
+- [`/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs`](/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs)
+
+Padrão do nome:
+
+- `grouped_clicks_YYYYMMDD_HHMMSS_microseconds.log`
+
+Esse arquivo é:
+
+- `1 arquivo por run`
+- compartilhado por todos os ciclos daquela execução
+- preenchido apenas com cliques bem-sucedidos
+
+Cada linha registrada contém:
+
+- `timestamp`
+- `city`
+- `rsw_id`
+- `query`
+- `final_url`
+
 ### Suporte em CLI
 
 O [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py) agora também aceita:

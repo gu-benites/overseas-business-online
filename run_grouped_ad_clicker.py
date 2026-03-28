@@ -28,6 +28,7 @@ JSON_SUMMARY_PREFIX = "JSON_SUMMARY:"
 UC_PROFILE_MARKER = str(UC_PROFILE_BASE_DIR) + "/"
 PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
 UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
+RUN_CLICK_LOG_DIR = "/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs"
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -386,6 +387,43 @@ def _resolve_concurrent_launch_stagger_seconds(cli_value: float | None) -> float
     return max(0.0, value)
 
 
+def _create_run_click_log_path() -> str:
+    os.makedirs(RUN_CLICK_LOG_DIR, exist_ok=True)
+    filename = f"grouped_clicks_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+    return os.path.join(RUN_CLICK_LOG_DIR, filename)
+
+
+def _append_run_click_log_header(
+    *,
+    path: str,
+    max_concurrent_groups: int,
+    launch_stagger_seconds: float,
+    max_runtime_minutes: float | None,
+    once: bool,
+    dry_run: bool,
+    group_city: str | None,
+) -> None:
+    started_at = datetime.now().isoformat(timespec="seconds")
+    lines = [
+        f"run_started_at={started_at}",
+        f"max_concurrent_groups={max_concurrent_groups}",
+        f"launch_stagger_seconds={launch_stagger_seconds:.1f}",
+        f"max_runtime_minutes={max_runtime_minutes if max_runtime_minutes else '-'}",
+        f"once={'yes' if once else 'no'}",
+        f"dry_run={'yes' if dry_run else 'no'}",
+        f"group_city={group_city or '-'}",
+        "",
+    ]
+    with open(path, "a", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(lines))
+
+
+def _append_run_click_log_footer(path: str) -> None:
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    with open(path, "a", encoding="utf-8") as file_obj:
+        file_obj.write(f"\nrun_finished_at={finished_at}\n")
+
+
 def _iter_target_groups(db: GroupsDB, group_city: str | None) -> list[GroupRecord]:
     groups = db.list_groups(enabled_only=True)
     if not group_city:
@@ -425,7 +463,7 @@ def _plan_cycle_without_advancing(
     return planned
 
 
-def _log_cycle_click_summary(grouped_cycle_id: str) -> None:
+def _log_cycle_click_summary(grouped_cycle_id: str, run_click_log_path: str | None = None) -> None:
     click_rows = ClickLogsDB().query_clicks_for_cycle(grouped_cycle_id)
     if not click_rows:
         logger.info(f"Cycle click summary [{grouped_cycle_id}]: no successful clicks recorded.")
@@ -434,15 +472,31 @@ def _log_cycle_click_summary(grouped_cycle_id: str) -> None:
     logger.info(
         f"Cycle click summary [{grouped_cycle_id}]: {len(click_rows)} successful click(s)."
     )
+    appended_lines: list[str] = []
     for city_name, rsw_id, final_url, click_timestamp, query, category, site_url in click_rows:
         logger.info(
             "Cycle click: "
             f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, final_url={final_url}, "
             f"timestamp={click_timestamp}, query={query}"
         )
+        appended_lines.append(
+            f"{click_timestamp} | city={city_name or '-'} | rsw_id={rsw_id or '-'} | "
+            f"query={query} | final_url={final_url}"
+        )
+    if run_click_log_path and appended_lines:
+        with open(run_click_log_path, "a", encoding="utf-8") as file_obj:
+            file_obj.write(f"[{grouped_cycle_id}]\n")
+            file_obj.write("\n".join(appended_lines))
+            file_obj.write("\n\n")
 
 
-def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
+def _run_cycle(
+    db: GroupsDB,
+    *,
+    dry_run: bool,
+    group_city: str | None,
+    run_click_log_path: str | None,
+) -> bool:
     grouped_cycle_id = datetime.now().strftime("cycle_%Y%m%d_%H%M%S_%f")
     planned = (
         _plan_cycle_without_advancing(db, group_city)
@@ -475,7 +529,7 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
             _cleanup_orphan_browsers()
             _cleanup_stale_uc_profile_dirs()
             _run_group_once(db, group, query, grouped_cycle_id=grouped_cycle_id)
-        _log_cycle_click_summary(grouped_cycle_id)
+        _log_cycle_click_summary(grouped_cycle_id, run_click_log_path)
         return True
 
     futures = []
@@ -500,7 +554,7 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
                 sleep(launch_stagger_seconds)
         for future in as_completed(futures):
             future.result()
-    _log_cycle_click_summary(grouped_cycle_id)
+    _log_cycle_click_summary(grouped_cycle_id, run_click_log_path)
     return True
 
 
@@ -539,6 +593,18 @@ def main() -> None:
         "Grouped runner launch stagger configured: "
         f"{resolved_launch_stagger_seconds:.1f} second(s)."
     )
+    run_click_log_path = _create_run_click_log_path()
+    _append_run_click_log_header(
+        path=run_click_log_path,
+        max_concurrent_groups=resolved_max_concurrent_groups,
+        launch_stagger_seconds=resolved_launch_stagger_seconds,
+        max_runtime_minutes=args.max_runtime_minutes,
+        once=args.once,
+        dry_run=args.dry_run,
+        group_city=args.group_city,
+    )
+    logger.info(f"Grouped runner click log file: {run_click_log_path}")
+    atexit.register(_append_run_click_log_footer, run_click_log_path)
 
     while True:
         if deadline is not None and monotonic() >= deadline:
@@ -548,7 +614,12 @@ def main() -> None:
         _cleanup_orphan_browsers()
         _cleanup_stale_uc_profile_dirs()
 
-        ran_any = _run_cycle(db, dry_run=args.dry_run, group_city=args.group_city)
+        ran_any = _run_cycle(
+            db,
+            dry_run=args.dry_run,
+            group_city=args.group_city,
+            run_click_log_path=run_click_log_path,
+        )
         if args.once or args.dry_run:
             return
 
