@@ -1,0 +1,65 @@
+import shutil
+import subprocess
+from pathlib import Path
+from time import time
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+UC_PROFILE_BASE_DIR = PROJECT_ROOT / ".tmp_uc_profiles"
+LEGACY_TMP_UC_PROFILE_BASE_DIR = Path("/tmp/uc_profiles")
+
+
+def _list_process_args() -> list[str]:
+    output = subprocess.check_output(
+        ["ps", "-eo", "args"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    return [line.strip() for line in output.splitlines()[1:] if line.strip()]
+
+
+def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:
+    """
+    Remove old UC profile directories that are no longer referenced by any process.
+
+    Returns aggregate counts for logging/inspection.
+    """
+
+    now = time()
+    process_args = _list_process_args()
+    removed_dirs = 0
+    freed_bytes = 0
+
+    for base_dir in (UC_PROFILE_BASE_DIR, LEGACY_TMP_UC_PROFILE_BASE_DIR):
+        if not base_dir.exists():
+            continue
+
+        for candidate in base_dir.iterdir():
+            if not candidate.is_dir():
+                continue
+            try:
+                age_seconds = now - candidate.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age_seconds < max_age_seconds:
+                continue
+
+            candidate_path = str(candidate)
+            if any(candidate_path in args for args in process_args):
+                continue
+
+            size_bytes = 0
+            try:
+                for child in candidate.rglob("*"):
+                    try:
+                        if child.is_file():
+                            size_bytes += child.stat().st_size
+                    except FileNotFoundError:
+                        continue
+                shutil.rmtree(candidate, ignore_errors=True)
+                removed_dirs += 1
+                freed_bytes += size_bytes
+            except Exception:
+                continue
+
+    return {"removed_dirs": removed_dirs, "freed_bytes": freed_bytes}

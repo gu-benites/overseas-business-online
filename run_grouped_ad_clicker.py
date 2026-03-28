@@ -1,5 +1,7 @@
 import argparse
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import json
 import os
 import re
@@ -9,14 +11,21 @@ import sys
 import traceback
 from time import monotonic, sleep
 
+from browser_cleanup import UC_PROFILE_BASE_DIR, cleanup_stale_uc_profiles
+from clicklogs_db import ClickLogsDB
 from config_reader import config
 from groups_db import GroupQueryRecord, GroupRecord, GroupsDB
+from job_control import (
+    clear_grouped_runner_cli_state,
+    should_register_grouped_runner_cli_state,
+    write_grouped_runner_cli_state,
+)
 from logger import logger
 
 
 STAT_PATTERN = re.compile(r"^\|\s*(?P<key>[^|]+?)\s*\|\s*(?P<value>[^|]+?)\s*\|$")
 JSON_SUMMARY_PREFIX = "JSON_SUMMARY:"
-UC_PROFILE_MARKER = "/tmp/uc_profiles/"
+UC_PROFILE_MARKER = str(UC_PROFILE_BASE_DIR) + "/"
 PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
 UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
 
@@ -88,10 +97,42 @@ def _parse_ad_clicker_stats(output: str) -> tuple[dict[str, str], dict[str, obje
     return stats, None
 
 
-def _build_command(query: str, proxy: str) -> list[str]:
+def _build_command(
+    query: str,
+    proxy: str,
+    city_name: str | None = None,
+    rsw_id: str | None = None,
+    grouped_cycle_id: str | None = None,
+) -> list[str]:
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--ad-clicker", "-q", query, "-p", proxy, "--json-summary"]
-    return [sys.executable, "ad_clicker.py", "-q", query, "-p", proxy, "--json-summary"]
+        command = [
+            sys.executable,
+            "--ad-clicker",
+            "-q",
+            query,
+            "-p",
+            proxy,
+            "--json-summary",
+            "--disable-no-clickable-ads-retry",
+        ]
+    else:
+        command = [
+        sys.executable,
+        "ad_clicker.py",
+        "-q",
+        query,
+        "-p",
+        proxy,
+        "--json-summary",
+        "--disable-no-clickable-ads-retry",
+        ]
+    if city_name:
+        command.extend(["--city-name", city_name])
+    if rsw_id is not None:
+        command.extend(["--rsw-id", str(rsw_id)])
+    if grouped_cycle_id:
+        command.extend(["--grouped-cycle-id", grouped_cycle_id])
+    return command
 
 
 def _log_planned_group(group: GroupRecord, query: GroupQueryRecord) -> None:
@@ -213,7 +254,26 @@ def _cleanup_orphan_browsers() -> None:
             logger.warning(f"Orphan browser cleanup: permission denied for pid={pid}")
 
 
-def _run_group_once(db: GroupsDB, group: GroupRecord, query: GroupQueryRecord) -> None:
+def _cleanup_stale_uc_profile_dirs() -> None:
+    result = cleanup_stale_uc_profiles(max_age_seconds=0)
+    if not result["removed_dirs"]:
+        logger.debug("UC profile dir cleanup: no stale profile directories found.")
+        return
+
+    freed_mb = result["freed_bytes"] / (1024 * 1024)
+    logger.info(
+        "UC profile dir cleanup: "
+        f"removed {result['removed_dirs']} stale profile dir(s), "
+        f"freed ~{freed_mb:.1f} MiB."
+    )
+
+
+def _run_group_once(
+    db: GroupsDB,
+    group: GroupRecord,
+    query: GroupQueryRecord,
+    grouped_cycle_id: str | None = None,
+) -> None:
     logger.info(
         "Running group: "
         f"city={group.city_name}, rsw_id={group.rsw_id}, "
@@ -228,7 +288,13 @@ def _run_group_once(db: GroupsDB, group: GroupRecord, query: GroupQueryRecord) -
     )
 
     result = subprocess.run(
-        _build_command(query.query_text, group.proxy),
+        _build_command(
+            query.query_text,
+            group.proxy,
+            city_name=group.city_name,
+            rsw_id=group.rsw_id,
+            grouped_cycle_id=grouped_cycle_id,
+        ),
         capture_output=True,
         text=True,
     )
@@ -359,7 +425,25 @@ def _plan_cycle_without_advancing(
     return planned
 
 
+def _log_cycle_click_summary(grouped_cycle_id: str) -> None:
+    click_rows = ClickLogsDB().query_clicks_for_cycle(grouped_cycle_id)
+    if not click_rows:
+        logger.info(f"Cycle click summary [{grouped_cycle_id}]: no successful clicks recorded.")
+        return
+
+    logger.info(
+        f"Cycle click summary [{grouped_cycle_id}]: {len(click_rows)} successful click(s)."
+    )
+    for city_name, rsw_id, final_url, click_timestamp, query, category, site_url in click_rows:
+        logger.info(
+            "Cycle click: "
+            f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, final_url={final_url}, "
+            f"timestamp={click_timestamp}, query={query}"
+        )
+
+
 def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
+    grouped_cycle_id = datetime.now().strftime("cycle_%Y%m%d_%H%M%S_%f")
     planned = (
         _plan_cycle_without_advancing(db, group_city)
         if dry_run
@@ -389,14 +473,25 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
     if max_concurrent_groups == 1:
         for group, query in planned:
             _cleanup_orphan_browsers()
-            _run_group_once(db, group, query)
+            _cleanup_stale_uc_profile_dirs()
+            _run_group_once(db, group, query, grouped_cycle_id=grouped_cycle_id)
+        _log_cycle_click_summary(grouped_cycle_id)
         return True
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_concurrent_groups) as executor:
         for index, (group, query) in enumerate(planned):
             _cleanup_orphan_browsers()
-            futures.append(executor.submit(_run_group_once, db, group, query))
+            _cleanup_stale_uc_profile_dirs()
+            futures.append(
+                executor.submit(
+                    _run_group_once,
+                    db,
+                    group,
+                    query,
+                    grouped_cycle_id,
+                )
+            )
             if index < len(planned) - 1 and launch_stagger_seconds > 0:
                 logger.debug(
                     "Waiting before launching next concurrent group: "
@@ -405,11 +500,22 @@ def _run_cycle(db: GroupsDB, *, dry_run: bool, group_city: str | None) -> bool:
                 sleep(launch_stagger_seconds)
         for future in as_completed(futures):
             future.result()
+    _log_cycle_click_summary(grouped_cycle_id)
     return True
 
 
 def main() -> None:
     args = get_arg_parser().parse_args()
+    registered_cli_state = False
+    cli_state_pid = os.getpid()
+    if should_register_grouped_runner_cli_state():
+        write_grouped_runner_cli_state()
+        registered_cli_state = True
+        atexit.register(clear_grouped_runner_cli_state, cli_state_pid)
+        logger.info(
+            "Grouped runner CLI state registered: "
+            f"pid={os.getpid()}, pgid={os.getpgid(0)}"
+        )
     db = GroupsDB()
     deadline = None
     resolved_max_concurrent_groups = _resolve_max_concurrent_groups(args.max_concurrent_groups)
@@ -438,6 +544,9 @@ def main() -> None:
         if deadline is not None and monotonic() >= deadline:
             logger.info("Grouped runner timer expired. Stopping loop cleanly.")
             return
+
+        _cleanup_orphan_browsers()
+        _cleanup_stale_uc_profile_dirs()
 
         ran_any = _run_cycle(db, dry_run=args.dry_run, group_city=args.group_city)
         if args.once or args.dry_run:

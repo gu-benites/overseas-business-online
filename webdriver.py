@@ -4,7 +4,6 @@ import random
 import string
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 from time import sleep
 from typing import Optional, Union
@@ -41,6 +40,7 @@ else:
     PYAUTOGUI_IMPORT_ERROR = None
 
 from config_reader import config
+from browser_cleanup import UC_PROFILE_BASE_DIR, cleanup_stale_uc_profiles
 from geolocation_db import GeolocationDB
 from logger import logger
 from proxy import (
@@ -338,7 +338,16 @@ def create_webdriver(
     if config.webdriver.incognito:
         chrome_options.add_argument("--incognito")
 
-    base_dir = Path(tempfile.gettempdir()) / "uc_profiles"
+    cleanup_result = cleanup_stale_uc_profiles(max_age_seconds=0)
+    if cleanup_result["removed_dirs"]:
+        freed_mb = cleanup_result["freed_bytes"] / (1024 * 1024)
+        logger.info(
+            "UC profile cleanup before browser startup: "
+            f"removed {cleanup_result['removed_dirs']} stale profile dir(s), "
+            f"freed ~{freed_mb:.1f} MiB."
+        )
+
+    base_dir = UC_PROFILE_BASE_DIR
     base_dir.mkdir(exist_ok=True)
     profile_dir = base_dir / f"profile_{random.randint(1000, 9999)}"
 

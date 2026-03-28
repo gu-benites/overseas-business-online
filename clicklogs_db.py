@@ -19,7 +19,18 @@ class ClickLogsDB:
     def __init__(self) -> None:
         self._create_db_table()
 
-    def save_click(self, site_url: str, category: str, query: str, click_time: str) -> None:
+    def save_click(
+        self,
+        site_url: str,
+        category: str,
+        query: str,
+        click_time: str,
+        city_name: str | None = None,
+        rsw_id: str | None = None,
+        final_url: str | None = None,
+        click_timestamp: str | None = None,
+        grouped_cycle_id: str | None = None,
+    ) -> None:
         """Save click_date, site_url, click_time, query, and category to database
 
         Raises RuntimeError if an error occurs during the save operation.
@@ -41,12 +52,32 @@ class ClickLogsDB:
             with self._clicklogs_db() as clicklogs_db_cursor:
                 # date will be in DD-MM-YYYY format.
                 click_date = datetime.now().strftime("%d-%m-%Y")
+                resolved_timestamp = click_timestamp or datetime.now().isoformat(timespec="seconds")
 
                 clicklogs_db_cursor.execute(
-                    "INSERT INTO clicklogs (click_date, click_time, site_url, query, category) VALUES (?, ?, ?, ?, ?)",
-                    (click_date, click_time, site_url, query, category),
+                    """
+                    INSERT INTO clicklogs (
+                        click_date, click_time, site_url, query, category,
+                        city_name, rsw_id, final_url, click_timestamp, grouped_cycle_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        click_date,
+                        click_time,
+                        site_url,
+                        query,
+                        category,
+                        city_name,
+                        rsw_id,
+                        final_url,
+                        resolved_timestamp,
+                        grouped_cycle_id,
+                    ),
                 )
-                log_details = f"{click_date} {click_time}, {site_url}, {query}, {category}"
+                log_details = (
+                    f"{click_date} {click_time}, {site_url}, {query}, {category}, "
+                    f"city={city_name}, rsw_id={rsw_id}, final_url={final_url}, cycle={grouped_cycle_id}"
+                )
                 logger.debug(f"Click log ({log_details}) was added to database.")
 
         except sqlite3.Error as exp:
@@ -95,9 +126,49 @@ class ClickLogsDB:
                     click_time TEXT NOT NULL,
                     site_url TEXT NOT NULL,
                     query TEXT NOT NULL,
-                    category TEXT NOT NULL
+                    category TEXT NOT NULL,
+                    city_name TEXT,
+                    rsw_id TEXT,
+                    final_url TEXT,
+                    click_timestamp TEXT,
+                    grouped_cycle_id TEXT
                 );"""
             )
+            existing_columns = {
+                row[1]
+                for row in clicklogs_db_cursor.execute("PRAGMA table_info(clicklogs)").fetchall()
+            }
+            for column_name, column_sql in (
+                ("city_name", "ALTER TABLE clicklogs ADD COLUMN city_name TEXT"),
+                ("rsw_id", "ALTER TABLE clicklogs ADD COLUMN rsw_id TEXT"),
+                ("final_url", "ALTER TABLE clicklogs ADD COLUMN final_url TEXT"),
+                ("click_timestamp", "ALTER TABLE clicklogs ADD COLUMN click_timestamp TEXT"),
+                ("grouped_cycle_id", "ALTER TABLE clicklogs ADD COLUMN grouped_cycle_id TEXT"),
+            ):
+                if column_name not in existing_columns:
+                    clicklogs_db_cursor.execute(column_sql)
+
+    def query_clicks_for_cycle(
+        self, grouped_cycle_id: str
+    ) -> list[tuple[str, str, str, str, str, str, str]]:
+        with self._clicklogs_db() as clicklogs_db_cursor:
+            clicklogs_db_cursor.execute(
+                """
+                SELECT
+                    COALESCE(city_name, ''),
+                    COALESCE(rsw_id, ''),
+                    COALESCE(final_url, site_url),
+                    COALESCE(click_timestamp, click_date || 'T' || click_time),
+                    query,
+                    category,
+                    site_url
+                FROM clicklogs
+                WHERE grouped_cycle_id = ?
+                ORDER BY click_timestamp ASC, id ASC
+                """,
+                (grouped_cycle_id,),
+            )
+            return clicklogs_db_cursor.fetchall()
 
     @contextmanager
     def _clicklogs_db(self) -> DBCursor:

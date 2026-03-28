@@ -95,10 +95,19 @@ class SearchController:
     NOT_NOW_BUTTON = (By.CSS_SELECTOR, "g-raised-button[data-ved]")
 
     def __init__(
-        self, driver: selenium.webdriver, query: str, country_code: Optional[str] = None
+        self,
+        driver: selenium.webdriver,
+        query: str,
+        country_code: Optional[str] = None,
+        city_name: Optional[str] = None,
+        rsw_id: Optional[str] = None,
+        grouped_cycle_id: Optional[str] = None,
     ) -> None:
         self._driver = driver
         self._search_query, self._filter_words = self._process_query(query)
+        self._city_name = city_name
+        self._rsw_id = str(rsw_id) if rsw_id is not None else None
+        self._grouped_cycle_id = grouped_cycle_id
         self._exclude_list = None
         self._ad_allowlist = get_ad_allowlist_domains()
         self._ad_denylist = get_ad_denylist_domains()
@@ -571,7 +580,12 @@ class SearchController:
                     else (link_url if is_ad_element else final_landed_url)
                 )
 
-                self._update_click_stats(url, click_time, category)
+                self._update_click_stats(
+                    url,
+                    click_time,
+                    category,
+                    final_url=final_landed_url,
+                )
 
                 if config.behavior.request_boost:
                     boost_requests(final_landed_url)
@@ -633,7 +647,13 @@ class SearchController:
         else:
             return random.choice(range(self._nonad_page_min_wait, self._nonad_page_max_wait))
 
-    def _update_click_stats(self, url: str, click_time: str, category: str) -> None:
+    def _update_click_stats(
+        self,
+        url: str,
+        click_time: str,
+        category: str,
+        final_url: str | None = None,
+    ) -> None:
         """Update click statistics
 
         :type url: str
@@ -652,7 +672,14 @@ class SearchController:
             self._stats.shopping_ads_clicked += 1
 
         self._clicklogs_db_client.save_click(
-            site_url=url, category=category, query=self._search_query, click_time=click_time
+            site_url=url,
+            category=category,
+            query=self._search_query,
+            click_time=click_time,
+            city_name=self._city_name,
+            rsw_id=self._rsw_id,
+            final_url=final_url,
+            grouped_cycle_id=self._grouped_cycle_id,
         )
 
     def _start_random_scroll_thread(self) -> None:

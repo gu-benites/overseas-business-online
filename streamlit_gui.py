@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -144,31 +145,126 @@ def start_process(script: str, extra_args: list[str] | None = None, process_key:
     try:
         log_file = open(log_path, "a", encoding="utf-8")
         process = subprocess.Popen(
-            args, cwd=str(ROOT), stdout=log_file, stderr=subprocess.STDOUT
+            args,
+            cwd=str(ROOT),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
         )
     except OSError as exc:
         st.error(f"Failed to start {script}: {exc}")
         return
+
+    try:
+        pgid = os.getpgid(process.pid) if os.name == "posix" else None
+    except Exception:
+        pgid = None
 
     jobs[key] = {
         "proc": process,
         "log": log_path,
         "args": args,
         "log_file": log_file,
+        "pgid": pgid,
     }
+
+
+def _list_process_rows() -> list[dict[str, Any]]:
+    output = subprocess.check_output(
+        ["ps", "-eo", "pid,pgid,ppid,comm,args"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    rows: list[dict[str, Any]] = []
+    for raw_line in output.splitlines()[1:]:
+        parts = raw_line.strip().split(None, 4)
+        if len(parts) < 5:
+            continue
+        pid, pgid, ppid, comm, args = parts
+        try:
+            rows.append(
+                {
+                    "pid": int(pid),
+                    "pgid": int(pgid),
+                    "ppid": int(ppid),
+                    "comm": comm,
+                    "args": args,
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def _process_group_members(pgid: int) -> list[dict[str, Any]]:
+    if not pgid:
+        return []
+    return [row for row in _list_process_rows() if int(row["pgid"]) == int(pgid)]
+
+
+def _kill_process_group(pgid: int | None) -> None:
+    if not pgid or os.name != "posix":
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+
+    try:
+        subprocess.run(["sleep", "2"], check=False)
+    except Exception:
+        pass
+
+    survivors = _process_group_members(pgid)
+    if not survivors:
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+
+
+def _job_has_live_processes(job: dict[str, Any]) -> bool:
+    proc = job["proc"]
+    pgid = job.get("pgid")
+    if proc.poll() is None:
+        if os.name == "posix" and pgid:
+            return bool(_process_group_members(int(pgid)))
+        return True
+    if os.name == "posix" and pgid:
+        return bool(_process_group_members(int(pgid)))
+    return False
 
 
 def _stop_job(job: dict[str, Any]) -> None:
     proc = job["proc"]
+    pgid = job.get("pgid")
     if proc.poll() is None:
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            if os.name == "posix" and pgid:
+                _kill_process_group(int(pgid))
+                proc.wait(timeout=5)
+            else:
+                proc.terminate()
+                proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2)
+            try:
+                if os.name == "posix" and pgid:
+                    _kill_process_group(int(pgid))
+                else:
+                    proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
+    elif os.name == "posix" and pgid and _process_group_members(int(pgid)):
+        _kill_process_group(int(pgid))
 
     try:
         job["log_file"].close()
@@ -790,6 +886,7 @@ if all_groups:
                 extra_args=grouped_loop_args or None,
                 process_key="run_grouped_ad_clicker",
             )
+            st.rerun()
     with runner_col_2:
         if st.button("RUN active groups once"):
             start_process(
@@ -803,6 +900,7 @@ if all_groups:
                 ],
                 process_key="run_grouped_ad_clicker_once",
             )
+            st.rerun()
     with runner_col_3:
         if st.button("RUN selected group once") and selected_group:
             start_process(
@@ -818,28 +916,34 @@ if all_groups:
                 ],
                 process_key="run_grouped_ad_clicker_selected",
             )
+            st.rerun()
 
 st.subheader("Actions")
 action_1, action_2, action_3, action_4, action_5 = st.columns(5)
 with action_1:
     if st.button("RUN ad_clicker.py"):
         start_process("ad_clicker.py")
+        st.rerun()
 
 with action_2:
     if st.button("RUN run_ad_clicker.py"):
         start_process("run_ad_clicker.py")
+        st.rerun()
 
 with action_3:
     if st.button("RUN run_in_loop.py"):
         start_process("run_in_loop.py")
+        st.rerun()
 
 with action_4:
     if st.button("GENERATE CLICK REPORT"):
         start_process("ad_clicker.py", ["--report_clicks", "--excel"], process_key="report_clicks")
+        st.rerun()
 
 with action_5:
     if st.button("RUN run_grouped_ad_clicker.py"):
         start_process("run_grouped_ad_clicker.py", process_key="run_grouped_ad_clicker")
+        st.rerun()
 
 
 st.subheader("Running jobs")
@@ -866,17 +970,18 @@ for script, label in tracked_processes:
         key = Path(script).stem
     with st.container():
         job = st.session_state["jobs"].get(key)
-        if job and job["proc"].poll() is not None:
+        if job and not _job_has_live_processes(job):
             _stop_job(job)
             st.session_state["jobs"].pop(key, None)
             job = None
-        if job and job["proc"].poll() is None:
+        if job and _job_has_live_processes(job):
             st.success(f"{label}: running (pid={job['proc'].pid})")
         else:
             st.info(f"{label}: not running")
 
         if st.button(f"Stop {label}", key=f"stop_{key}"):
             stop_process(key)
+            st.rerun()
 
         if job:
             with st.expander(f"{label} log", expanded=False):

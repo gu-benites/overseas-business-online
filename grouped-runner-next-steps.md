@@ -845,3 +845,129 @@ O runner foi ajustado para tratar isso de forma limpa:
 - agora, em caso de `KeyboardInterrupt`, ele registra:
   - `Grouped runner interrupted by user. Stopping cleanly.`
 - e evita despejar traceback feio no log como se fosse erro operacional do ciclo
+
+## Diagnóstico do Playwright MCP
+
+Foi depurado um bloqueio do Playwright MCP no VPS.
+
+Sintoma observado:
+
+- `browserType.launchPersistentContext: Failed to launch the browser process`
+- Chromium/Playwright encerrando com `SIGTRAP` antes de qualquer navegação
+
+Diagnóstico real encontrado:
+
+- o problema principal não era o Streamlit nem o MCP em si
+- a `tmpfs` de `/tmp` estava em `100%`
+- o diretório `/tmp/uc_profiles` acumulou cerca de `1.9G` em perfis antigos do UC
+- enquanto `/tmp` estava cheio, o Chromium local falhava até em testes simples como:
+  - `chromium --headless --dump-dom about:blank`
+
+Correção operacional aplicada:
+
+- limpeza manual dos perfis antigos em `/tmp/uc_profiles`
+- após essa limpeza:
+  - `/tmp` voltou para cerca de `1%` de uso
+  - o Chromium headless voltou a funcionar
+  - o Playwright MCP voltou a navegar normalmente
+
+Hardening aplicado no codebase:
+
+- [`browser_cleanup.py`](/home/otavio/overseas-business-online/browser_cleanup.py)
+  - helper para remover perfis UC antigos não referenciados por processos vivos
+- [`webdriver.py`](/home/otavio/overseas-business-online/webdriver.py)
+  - limpeza automática de perfis UC antigos antes de criar novo browser
+- [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py)
+  - limpeza automática desses perfis antes de iniciar cada grupo
+
+Endurecimento adicional aplicado depois:
+
+- os perfis UC novos não ficam mais em `/tmp`
+- agora eles ficam em:
+  - [`/home/otavio/overseas-business-online/.tmp_uc_profiles`](/home/otavio/overseas-business-online/.tmp_uc_profiles)
+- a limpeza automática continua removendo também o legado em:
+  - `/tmp/uc_profiles`
+- o grouped loop passou a limpar logo no início de cada ciclo, antes mesmo de planejar os grupos
+- a limpeza de perfis UC ficou agressiva:
+  - qualquer perfil sem processo vivo referenciando-o já pode ser removido no próximo ciclo/startup
+  - não espera mais 30 minutos para reciclar perfis já usados
+
+Leitura prática:
+
+- se o Playwright MCP voltar a falhar com `SIGTRAP`, a primeira checagem deve ser:
+  - uso de `/tmp`
+  - tamanho acumulado de `/tmp/uc_profiles`
+
+## Correção de fallback de query no grouped runner
+
+Foi identificado um bug no fluxo agrupado:
+
+- quando um run não encontrava anúncios clicáveis, o [`ad_clicker.py`](/home/otavio/overseas-business-online/ad_clicker.py)
+  ainda podia cair no fallback interno baseado em [`queries.txt`](/home/otavio/overseas-business-online/queries.txt)
+- isso permitia que um grupo do SQLite escapasse para uma query global fora do próprio grupo
+
+Correção aplicada:
+
+- [`ad_clicker.py`](/home/otavio/overseas-business-online/ad_clicker.py)
+  - nova flag:
+    - `--disable-no-clickable-ads-retry`
+- [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py)
+  - agora sempre chama o `ad_clicker` com essa flag
+
+Efeito:
+
+- no grouped runner, se um grupo não achar anúncios clicáveis:
+  - ele encerra limpo
+  - não pula para [`queries.txt`](/home/otavio/overseas-business-online/queries.txt)
+  - a próxima query continua sendo decidida apenas pela rotação do SQLite
+
+## Lifecycle forte também para CLI
+
+O lifecycle forte não ficou só no Streamlit.
+
+Agora, para execução direta por CLI:
+
+- [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py)
+  - registra `pid` e `pgid` quando iniciado direto do shell
+  - grava isso em:
+    - [`/home/otavio/overseas-business-online/.runtime/run_grouped_ad_clicker_cli.json`](/home/otavio/overseas-business-online/.runtime/run_grouped_ad_clicker_cli.json)
+- [`job_control.py`](/home/otavio/overseas-business-online/job_control.py)
+  - centraliza leitura do estado e kill do process group
+- [`stop_grouped_runner.py`](/home/otavio/overseas-business-online/scripts/stop_grouped_runner.py)
+  - mata o process group inteiro do grouped runner CLI
+  - isso cobre:
+    - grouped runner
+    - filhos `ad_clicker.py`
+    - `undetected_chromedriver`
+    - demais filhos no mesmo PGID
+
+Uso esperado:
+
+```bash
+./.venv/bin/python run_grouped_ad_clicker.py --max-concurrent-groups 2
+./.venv/bin/python scripts/stop_grouped_runner.py
+```
+
+## Resumo de cliques por ciclo do grouped runner
+
+O grouped runner agora registra contexto suficiente para emitir um resumo de cliques bem mais útil ao final de cada ciclo.
+
+Campos persistidos no [`clicklogs.db`](/home/otavio/overseas-business-online/clicklogs.db):
+
+- `city_name`
+- `rsw_id`
+- `final_url`
+- `click_timestamp`
+- `grouped_cycle_id`
+
+Com isso, ao final de cada ciclo do [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py), o log passa a registrar cada clique bem-sucedido no formato:
+
+- cidade
+- `rsw_id`
+- `final_url`
+- `timestamp`
+- `query`
+
+Leitura prática:
+
+- isso permite saber exatamente quais cliques aconteceram em cada ciclo do grouped runner

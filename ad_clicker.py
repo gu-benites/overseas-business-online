@@ -98,10 +98,18 @@ def get_arg_parser() -> ArgumentParser:
         "--check_stealth", action="store_true", help="Check stealth for undetection"
     )
     arg_parser.add_argument("-d", "--device_id", help="Android device ID for assigning to browser")
+    arg_parser.add_argument("--city-name", help="City context for grouped runner click logs")
+    arg_parser.add_argument("--rsw-id", help="RSW ID context for grouped runner click logs")
+    arg_parser.add_argument("--grouped-cycle-id", help="Grouped runner cycle id for click log aggregation")
     arg_parser.add_argument(
         "--json-summary",
         action="store_true",
         help="Print machine-readable run summary for automation consumers",
+    )
+    arg_parser.add_argument(
+        "--disable-no-clickable-ads-retry",
+        action="store_true",
+        help="Disable internal retry/next-query fallback when no clickable ads are found",
     )
 
     return arg_parser
@@ -217,7 +225,14 @@ def main():
         max_retries = max(0, int(config.behavior.no_clickable_ads_max_retries))
 
         while True:
-            search_controller = SearchController(driver, current_query, country_code)
+            search_controller = SearchController(
+                driver,
+                current_query,
+                country_code,
+                city_name=args.city_name,
+                rsw_id=args.rsw_id,
+                grouped_cycle_id=args.grouped_cycle_id,
+            )
 
             if args.id:
                 search_controller.set_browser_id(args.id)
@@ -237,7 +252,11 @@ def main():
                 if config.behavior.telegram_enabled:
                     notify_matching_ads(current_query, links=None, stats=search_controller.stats)
 
-                if retries_done < max_retries and _should_retry_when_no_clickable_ads():
+                if (
+                    not args.disable_no_clickable_ads_retry
+                    and retries_done < max_retries
+                    and _should_retry_when_no_clickable_ads()
+                ):
                     next_query = (
                         _get_next_query(current_query)
                         if config.paths.query_file
@@ -250,6 +269,12 @@ def main():
                     current_query = next_query
                     retries_done += 1
                     continue
+
+                if args.disable_no_clickable_ads_retry:
+                    logger.info(
+                        "No-clickable-ads retry is disabled for this run. "
+                        "Exiting without switching to global query_file."
+                    )
 
                 logger.info("No-clickable-ads fallback selected clean exit.")
                 logger.info(search_controller.stats)
