@@ -16,6 +16,7 @@ from config_reader import config
 from logger import logger, update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
+from stats import SearchStats
 from utils import (
     get_queries,
     get_random_user_agent_string,
@@ -198,6 +199,7 @@ def main():
     country_code = None
     search_controller = None
     json_summary_emitted = False
+    fallback_summary = None
 
     try:
         driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
@@ -337,6 +339,14 @@ def main():
         logger.debug(f"Exception: {message}")
         details = traceback.format_tb(exp.__traceback__)
         logger.debug(f"Exception details: \n{''.join(details)}")
+        proxy_tunnel_connection_failed = "ERR_TUNNEL_CONNECTION_FAILED" in message
+        if search_controller:
+            search_controller.stats.proxy_tunnel_connection_failed = proxy_tunnel_connection_failed
+        else:
+            fallback_stats = SearchStats(
+                proxy_tunnel_connection_failed=proxy_tunnel_connection_failed
+            )
+            fallback_summary = asdict(fallback_stats)
 
         logger.debug(f"Exception cause: {exp.__cause__}") if exp.__cause__ else None
 
@@ -351,6 +361,7 @@ def main():
                     + json.dumps(asdict(search_controller.stats), ensure_ascii=False),
                     flush=True,
                 )
+                json_summary_emitted = True
 
             if config.behavior.hooks_enabled:
                 hooks.before_browser_close_hook(driver)
@@ -359,6 +370,12 @@ def main():
 
             if config.behavior.hooks_enabled:
                 hooks.after_browser_close_hook(driver)
+        elif args.json_summary and fallback_summary and not json_summary_emitted:
+            print(
+                "JSON_SUMMARY:" + json.dumps(fallback_summary, ensure_ascii=False),
+                flush=True,
+            )
+            json_summary_emitted = True
         elif driver:
             driver.quit()
 

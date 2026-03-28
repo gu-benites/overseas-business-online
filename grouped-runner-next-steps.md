@@ -996,3 +996,23 @@ Com isso, ao final de cada ciclo do [`run_grouped_ad_clicker.py`](/home/otavio/o
 Leitura prática:
 
 - isso permite saber exatamente quais cliques aconteceram em cada ciclo do grouped runner
+
+### Mitigacao de 402 do proxy
+
+- quando o output do [`ad_clicker.py`](/home/otavio/overseas-business-online/ad_clicker.py) contem `402 Payment Required`, o worker do grouped runner nao libera a vaga imediatamente
+- em vez disso, ele faz um health-check do proxy a cada `60s`
+- se o proxy voltar a responder, o slot e liberado para o proximo grupo
+- se continuar ruim, ele espera mais `60s` e testa de novo
+- isso vale tanto para execucao sequencial quanto concorrente, porque a thread/processo do slot so termina depois do proxy ficar saudavel
+
+### Validacao mais recente do health-check do proxy
+
+Foi validado em execucao real curta:
+
+- `proxy_tunnel_failed=Yes` agora aparece no summary estruturado do grouped runner
+- o runner detecta esse caso como proxy unhealthy
+- o slot nao e liberado imediatamente para o proximo grupo
+- em vez disso, entra no modo:
+  - `Proxy returned 402 Payment Required. Will poll proxy health every 60 seconds...`
+
+Isso confirma que o controle saiu do log global compartilhado e passou a depender do `JSON_SUMMARY` do worker.

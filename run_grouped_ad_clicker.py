@@ -21,6 +21,7 @@ from job_control import (
     write_grouped_runner_cli_state,
 )
 from logger import logger
+from utils import get_proxy_exit_ip
 
 
 STAT_PATTERN = re.compile(r"^\|\s*(?P<key>[^|]+?)\s*\|\s*(?P<value>[^|]+?)\s*\|$")
@@ -29,6 +30,9 @@ UC_PROFILE_MARKER = str(UC_PROFILE_BASE_DIR) + "/"
 PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
 UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
 RUN_CLICK_LOG_DIR = "/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs"
+PROXY_PAYMENT_REQUIRED_MARKER = "402 Payment Required"
+PROXY_TUNNEL_FAILED_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
+PROXY_PAYMENT_REQUIRED_POLL_SECONDS = 60
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -68,6 +72,9 @@ def _parse_ad_clicker_stats(output: str) -> tuple[dict[str, str], dict[str, obje
                     "Latest Proxy IP": str(payload.get("latest_proxy_ip", "") or ""),
                     "IP Changed Mid-session": (
                         "Yes" if payload.get("ip_changed_mid_session") else "No"
+                    ),
+                    "Proxy Tunnel Failed": (
+                        "Yes" if payload.get("proxy_tunnel_connection_failed") else "No"
                     ),
                     "Captcha Seen": "Yes" if payload.get("captcha_seen") else "No",
                     "Captcha Token Received": (
@@ -269,6 +276,30 @@ def _cleanup_stale_uc_profile_dirs() -> None:
     )
 
 
+def _wait_until_proxy_healthy(group: GroupRecord) -> None:
+    logger.warning(
+        "Proxy returned 402 Payment Required. "
+        "Will poll proxy health every "
+        f"{PROXY_PAYMENT_REQUIRED_POLL_SECONDS} seconds before freeing the slot: "
+        f"city={group.city_name}, rsw_id={group.rsw_id}"
+    )
+
+    while True:
+        sleep(PROXY_PAYMENT_REQUIRED_POLL_SECONDS)
+        exit_ip = get_proxy_exit_ip(group.proxy, max_retries=1, retry_sleep_seconds=1)
+        if exit_ip:
+            logger.info(
+                "Proxy health restored after 402 Payment Required: "
+                f"city={group.city_name}, rsw_id={group.rsw_id}, exit_ip={exit_ip}"
+            )
+            return
+        logger.warning(
+            "Proxy still unhealthy after 402 Payment Required. "
+            f"Will retry in {PROXY_PAYMENT_REQUIRED_POLL_SECONDS} seconds: "
+            f"city={group.city_name}, rsw_id={group.rsw_id}"
+        )
+
+
 def _run_group_once(
     db: GroupsDB,
     group: GroupRecord,
@@ -318,6 +349,7 @@ def _run_group_once(
     captcha_token_applied = stats.get("Captcha Token Applied")
     captcha_accepted = stats.get("Captcha Accepted")
     google_blocked_after_captcha = stats.get("Google Blocked After Captcha")
+    proxy_tunnel_failed = stats.get("Proxy Tunnel Failed")
     ads_found = stats.get("Ads Found")
     ads_clicked = stats.get("Ads Clicked")
 
@@ -330,6 +362,8 @@ def _run_group_once(
             f"{summary_payload.get('latest_proxy_ip')}"
             ", ip_changed_mid_session="
             f"{summary_payload.get('ip_changed_mid_session')}"
+            ", proxy_tunnel_connection_failed="
+            f"{summary_payload.get('proxy_tunnel_connection_failed')}"
             ", captcha_token_received="
             f"{summary_payload.get('captcha_token_received')}"
             ", captcha_token_applied="
@@ -361,8 +395,16 @@ def _run_group_once(
         f"captcha_token_received={captcha_token_received or '-'}, "
         f"captcha_token_applied={captcha_token_applied or '-'}, "
         f"captcha_accepted={captcha_accepted or '-'}, "
-        f"google_blocked_after_captcha={google_blocked_after_captcha or '-'}"
+        f"google_blocked_after_captcha={google_blocked_after_captcha or '-'}, "
+        f"proxy_tunnel_failed={proxy_tunnel_failed or '-'}"
     )
+
+    if (
+        PROXY_PAYMENT_REQUIRED_MARKER in output
+        or PROXY_TUNNEL_FAILED_MARKER in output
+        or (summary_payload and summary_payload.get("proxy_tunnel_connection_failed"))
+    ):
+        _wait_until_proxy_healthy(group)
 
 
 def _resolve_max_concurrent_groups(cli_value: int | None) -> int:

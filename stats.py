@@ -8,6 +8,7 @@ class SearchStats:
     initial_proxy_ip: str = ""
     latest_proxy_ip: str = ""
     ip_changed_mid_session: bool = False
+    proxy_tunnel_connection_failed: bool = False
     captcha_seen: bool = False
     captcha_token_received: bool = False
     captcha_token_applied: bool = False
@@ -35,6 +36,10 @@ class SearchStats:
             ("Initial Proxy IP", self.initial_proxy_ip) if self.initial_proxy_ip else None,
             ("Latest Proxy IP", self.latest_proxy_ip) if self.latest_proxy_ip else None,
             ("IP Changed Mid-session", "Yes" if self.ip_changed_mid_session else "No"),
+            (
+                "Proxy Tunnel Failed",
+                "Yes" if self.proxy_tunnel_connection_failed else "No",
+            ),
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
             ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
             ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),
@@ -70,6 +75,10 @@ class SearchStats:
             ("Initial Proxy IP", self.initial_proxy_ip) if self.initial_proxy_ip else None,
             ("Latest Proxy IP", self.latest_proxy_ip) if self.latest_proxy_ip else None,
             ("IP Changed Mid-session", "Yes" if self.ip_changed_mid_session else "No"),
+            (
+                "Proxy Tunnel Failed",
+                "Yes" if self.proxy_tunnel_connection_failed else "No",
+            ),
             ("Captcha Seen", "Yes" if self.captcha_seen else "No"),
             ("Captcha Token Received", "Yes" if self.captcha_token_received else "No"),
             ("Captcha Token Applied", "Yes" if self.captcha_token_applied else "No"),
