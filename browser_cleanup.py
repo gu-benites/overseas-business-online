@@ -7,6 +7,7 @@ from time import time
 PROJECT_ROOT = Path(__file__).resolve().parent
 UC_PROFILE_BASE_DIR = PROJECT_ROOT / ".tmp_uc_profiles"
 LEGACY_TMP_UC_PROFILE_BASE_DIR = Path("/tmp/uc_profiles")
+PROXY_AUTH_PLUGIN_BASE_DIR = PROJECT_ROOT / "proxy_auth_plugin"
 
 
 def _list_process_args() -> list[str]:
@@ -20,7 +21,12 @@ def _list_process_args() -> list[str]:
 
 def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:
     """
-    Remove old UC profile directories that are no longer referenced by any process.
+    Remove old browser runtime directories that are no longer referenced by any process.
+
+    This covers:
+    - active UC temp profiles in the project-local directory
+    - legacy UC profiles under /tmp
+    - generated proxy auth plugin directories
 
     Returns aggregate counts for logging/inspection.
     """
@@ -30,7 +36,11 @@ def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:
     removed_dirs = 0
     freed_bytes = 0
 
-    for base_dir in (UC_PROFILE_BASE_DIR, LEGACY_TMP_UC_PROFILE_BASE_DIR):
+    for base_dir in (
+        UC_PROFILE_BASE_DIR,
+        LEGACY_TMP_UC_PROFILE_BASE_DIR,
+        PROXY_AUTH_PLUGIN_BASE_DIR,
+    ):
         if not base_dir.exists():
             continue
 

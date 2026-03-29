@@ -49,6 +49,7 @@ Componentes principais:
 - cleanup automático existe para:
   - browsers órfãos
   - perfis UC antigos
+  - diretórios antigos gerados em `proxy_auth_plugin`
   - artefatos antigos de logs e screenshots
 
 ## Logs e artefatos
