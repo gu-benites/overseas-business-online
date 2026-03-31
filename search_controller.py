@@ -400,7 +400,9 @@ class SearchController:
                     )
                 self._save_step_screenshot("shopping_after_click")
 
-            except Exception:
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("shopping_ad_click", exp)
                 logger.debug(f"Failed to click ad element [{ad_title}]!")
 
     def click_links(self, links: AllLinks) -> None:
@@ -451,7 +453,9 @@ class SearchController:
                     "Skipping scroll into view..."
                 )
 
-            except Exception:
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("search_result_click", exp)
                 logger.error(f"Failed to click on [{ad_title if is_ad_element else link_url}]!")
 
     def _save_step_screenshot(self, step_name: str) -> None:
@@ -473,6 +477,11 @@ class SearchController:
             self._driver.save_screenshot(str(screenshot_path))
             logger.debug(f"Saved run screenshot: {screenshot_path}")
         except Exception as exp:
+            if (
+                not step_name.endswith("_browser_unavailable")
+                and self._is_browser_session_unavailable_exception(exp)
+            ):
+                self._abort_due_to_browser_unavailable(f"{step_name}_screenshot", exp)
             logger.debug(f"Failed to save step screenshot ({step_name}): {exp}")
 
     def _on_captcha_poll(self, response_text: str, retry_count: int) -> None:
@@ -616,65 +625,80 @@ class SearchController:
         :param category: Specifies link category as Ad, Non-ad, or Shopping
         """
 
-        self._open_link_in_new_tab(link_element)
-
-        if len(self._driver.window_handles) != 2:
-            logger.debug("Couldn't click! Scrolling element into view...")
-            self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
+        try:
             self._open_link_in_new_tab(link_element)
+            self._ensure_browser_session_alive("browser_click_after_open_tab")
 
-        if len(self._driver.window_handles) != 2:
-            logger.debug(f"Failed to open '{link_url}' in a new tab!")
-            return
-        else:
-            logger.debug("Opened link in a new tab. Switching to tab...")
+            if len(self._driver.window_handles) != 2:
+                logger.debug("Couldn't click! Scrolling element into view...")
+                self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
+                self._open_link_in_new_tab(link_element)
+                self._ensure_browser_session_alive("browser_click_after_retry_open_tab")
 
-        for window_handle in self._driver.window_handles:
-            if window_handle != original_window_handle:
-                self._driver.switch_to.window(window_handle)
-                click_time = datetime.now().strftime("%H:%M:%S")
-                self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
+            if len(self._driver.window_handles) != 2:
+                logger.debug(f"Failed to open '{link_url}' in a new tab!")
+                return
+            else:
+                logger.debug("Opened link in a new tab. Switching to tab...")
 
-                sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
-                clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
-                final_landed_url = self._driver.current_url
-                logger.info(f"{category} click target URL: {clicked_target_url}")
-                logger.info(f"{category} final landed URL: {final_landed_url}")
-                logger.debug(f"Current url on new tab: {final_landed_url}")
+            for window_handle in self._driver.window_handles:
+                if window_handle != original_window_handle:
+                    self._driver.switch_to.window(window_handle)
+                    self._ensure_browser_session_alive("browser_click_after_tab_switch")
+                    click_time = datetime.now().strftime("%H:%M:%S")
+                    self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
+                    self._ensure_browser_session_alive("browser_click_after_landing_opened")
 
-                if self._hooks_enabled and category in ("Ad", "Shopping"):
-                    hooks.after_ad_click_hook(self._driver)
+                    sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
+                    self._ensure_browser_session_alive("browser_click_after_landing_wait")
+                    clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
+                    final_landed_url = self._driver.current_url
+                    logger.info(f"{category} click target URL: {clicked_target_url}")
+                    logger.info(f"{category} final landed URL: {final_landed_url}")
+                    logger.debug(f"Current url on new tab: {final_landed_url}")
 
-                self._maybe_click_whatsapp_interaction(category)
-                self._start_random_action_threads()
+                    if self._hooks_enabled and category in ("Ad", "Shopping"):
+                        hooks.after_ad_click_hook(self._driver)
 
-                url = (
-                    "/".join(final_landed_url.split("/", maxsplit=3)[:3])
-                    if category == "Shopping"
-                    else (link_url if is_ad_element else final_landed_url)
-                )
+                    self._maybe_click_whatsapp_interaction(category)
+                    self._ensure_browser_session_alive("browser_click_after_whatsapp")
+                    self._start_random_action_threads()
+                    self._ensure_browser_session_alive("browser_click_after_random_actions")
 
-                self._update_click_stats(
-                    url,
-                    click_time,
-                    category,
-                    final_url=final_landed_url,
-                )
+                    url = (
+                        "/".join(final_landed_url.split("/", maxsplit=3)[:3])
+                        if category == "Shopping"
+                        else (link_url if is_ad_element else final_landed_url)
+                    )
 
-                if config.behavior.request_boost:
-                    boost_requests(final_landed_url)
+                    self._update_click_stats(
+                        url,
+                        click_time,
+                        category,
+                        final_url=final_landed_url,
+                    )
 
-                wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
-                logger.debug(f"Waiting {wait_time} seconds on {category.lower()} page...")
-                sleep(wait_time)
-                self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_before_close")
+                    if config.behavior.request_boost:
+                        boost_requests(final_landed_url)
 
-                self._driver.close()
-                break
+                    wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
+                    logger.debug(f"Waiting {wait_time} seconds on {category.lower()} page...")
+                    sleep(wait_time)
+                    self._ensure_browser_session_alive("browser_click_before_landing_close")
+                    self._save_step_screenshot(
+                        f"{category.lower().replace('-', '_')}_landing_before_close"
+                    )
 
-        # go back to the original window
-        self._driver.switch_to.window(original_window_handle)
-        sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+                    self._driver.close()
+                    break
+
+            # go back to the original window
+            self._driver.switch_to.window(original_window_handle)
+            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("browser_click", exp)
+            raise
 
     def _maybe_click_whatsapp_interaction(self, category: str) -> None:
         """Optionally click a visible WhatsApp-style CTA on the landing page."""
@@ -857,6 +881,10 @@ class SearchController:
                     f"Failed to click element[{link_element.get_attribute('outerHTML')}]! "
                     "Skipping..."
                 )
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("open_link_in_new_tab", exp)
+            raise
 
     def _get_wait_time(self, is_ad_element: bool) -> int:
         """Get wait time based on whether the link is an ad or non-ad
