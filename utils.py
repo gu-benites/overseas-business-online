@@ -71,9 +71,12 @@ def get_random_user_agent_string() -> Optional[str]:
     :returns: User agent string
     """
 
-    identity_mode = getattr(config.webdriver, "identity_mode", "legacy")
-    if identity_mode == "native_linux":
-        logger.info("Identity mode 'native_linux' enabled. Using browser native Linux desktop identity.")
+    identity_mode = getattr(config.webdriver, "identity_mode", "native_linux")
+    if identity_mode != "legacy":
+        logger.info(
+            f"Identity mode '{identity_mode}' enabled. "
+            "Using browser native Linux desktop identity."
+        )
         return None
 
     all_user_agents = _get_user_agents(config.paths.user_agents)

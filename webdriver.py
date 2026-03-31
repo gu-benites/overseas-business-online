@@ -243,61 +243,38 @@ def _get_browser_binary_path() -> str:
     )
 
 
-def _ensure_local_uc_driver_cache() -> None:
-    """Keep the UC driver cache aligned with the system architecture on ARM hosts."""
+def _resolve_driver_source_executable() -> Path:
+    """Resolve a concrete chromedriver binary to copy for this worker.
 
-    if platform.machine() not in ("aarch64", "arm64", "armv8l"):
-        return
+    We intentionally avoid UC's shared cache so concurrent workers never race
+    on ``~/.local/share/undetected_chromedriver``.
+    """
 
-    system_driver = Path("/usr/bin/chromedriver")
-    if not system_driver.exists():
-        return
-
-    local_driver = Path(_get_driver_exe_path()).expanduser()
-    local_driver.parent.mkdir(parents=True, exist_ok=True)
-
-    should_refresh = not local_driver.exists()
-    if not should_refresh:
-        try:
-            file_output = subprocess.check_output(
-                ["file", str(local_driver)],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-            should_refresh = "aarch64" not in file_output.lower()
-        except Exception:
-            should_refresh = True
-
-    if not should_refresh:
-        return
-
-    try:
-        shutil.copy2(system_driver, local_driver)
-        local_driver.chmod(0o755)
-        logger.info(f"Refreshed local UC driver cache from system chromedriver: {local_driver}")
-    except Exception as exp:
-        logger.warning(f"Failed to refresh local UC driver cache: {exp}")
+    candidates = [
+        os.getenv("CHROMEDRIVER"),
+        shutil.which("chromedriver"),
+        "/usr/bin/chromedriver",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.exists():
+            return candidate_path
+    raise RuntimeError(
+        "Chromedriver binary not found. Install chromedriver or set CHROMEDRIVER."
+    )
 
 
-def _get_preferred_driver_executable_path(multi_procs_enabled: bool) -> str | None:
-    """Return a stable driver path, avoiding UC's broken x86 cache on ARM hosts."""
-
-    if platform.machine() in ("aarch64", "arm64", "armv8l"):
-        system_driver = Path("/usr/bin/chromedriver")
-        local_driver = PROJECT_ROOT / ".runtime" / "chromedriver-arm64"
-        if system_driver.exists():
-            try:
-                local_driver.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(system_driver, local_driver)
-                local_driver.chmod(0o755)
-                return str(local_driver)
-            except Exception as exp:
-                logger.warning(f"Failed to prepare ARM chromedriver copy: {exp}")
-    if multi_procs_enabled:
-        driver_exe_path = _get_driver_exe_path()
-        if Path(driver_exe_path).exists():
-            return driver_exe_path
-    return None
+def _prepare_isolated_driver_executable() -> str | None:
+    """Create a per-run chromedriver copy so concurrent workers never share one binary."""
+    source_driver = _resolve_driver_source_executable()
+    runtime_driver_dir = PROJECT_ROOT / ".runtime" / "chromedriver_workers"
+    runtime_driver_dir.mkdir(parents=True, exist_ok=True)
+    isolated_driver = runtime_driver_dir / f"chromedriver-arm64-{os.getpid()}-{random.randint(1000, 9999)}"
+    shutil.copy2(source_driver, isolated_driver)
+    isolated_driver.chmod(0o755)
+    return str(isolated_driver)
 
 
 def _has_usable_display(display_value: str | None) -> bool:
@@ -369,6 +346,13 @@ class CustomChrome(undetected_chromedriver.Chrome):
         # dereference patcher, so patcher can start cleaning up as well.
         # this must come last, otherwise it will throw 'in use' errors
         self.patcher = None
+
+        runtime_driver_executable = getattr(self, "_runtime_driver_executable", None)
+        if runtime_driver_executable:
+            try:
+                Path(runtime_driver_executable).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def __del__(self):
         try:
@@ -507,12 +491,10 @@ def create_webdriver(
 
     country_code = None
 
-    multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
-    multi_procs_enabled = multi_browser_flag_file.exists()
-    driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
+    isolated_driver_exe_path = _prepare_isolated_driver_executable()
+    driver_exe_path = isolated_driver_exe_path
 
     browser_binary_path = _get_browser_binary_path()
-    _ensure_local_uc_driver_cache()
     if proxy:
         if config.webdriver.auth:
             username, password, host, port = _parse_proxy_components(proxy)
@@ -535,7 +517,7 @@ def create_webdriver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
-        if not country_code and getattr(config.webdriver, "identity_mode", "legacy") == "native_linux":
+        if not country_code and getattr(config.webdriver, "identity_mode", "native_linux") == "native_linux":
             inferred_country_code = _infer_country_code_from_proxy(proxy)
             if inferred_country_code:
                 country_code = inferred_country_code
@@ -556,9 +538,10 @@ def create_webdriver(
         browser_executable_path=browser_binary_path,
         driver_executable_path=driver_exe_path,
         options=chrome_options,
-        user_multi_procs=multi_procs_enabled,
+        user_multi_procs=False,
         use_subprocess=True,
     )
+    driver._runtime_driver_executable = isolated_driver_exe_path
 
     if locale_code or accept_language:
         _apply_browser_locale_overrides(driver, accept_language=accept_language)
@@ -775,41 +758,6 @@ def _shift_window_position(
 
     driver.set_window_position(new_x, new_y)
     sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
-
-
-def _get_driver_exe_path() -> str:
-    """Get the path for the chromedriver executable to avoid downloading and patching each time
-
-    :rtype: str
-    :returns: Absoulute path of the chromedriver executable
-    """
-
-    platform = sys.platform
-    prefix = "undetected"
-    exe_name = "chromedriver%s"
-
-    if platform.endswith("win32"):
-        exe_name %= ".exe"
-    if platform.endswith(("linux", "linux2")):
-        exe_name %= ""
-    if platform.endswith("darwin"):
-        exe_name %= ""
-
-    if platform.endswith("win32"):
-        dirpath = "~/appdata/roaming/undetected_chromedriver"
-    elif "LAMBDA_TASK_ROOT" in os.environ:
-        dirpath = "/tmp/undetected_chromedriver"
-    elif platform.startswith(("linux", "linux2")):
-        dirpath = "~/.local/share/undetected_chromedriver"
-    elif platform.endswith("darwin"):
-        dirpath = "~/Library/Application Support/undetected_chromedriver"
-    else:
-        dirpath = "~/.undetected_chromedriver"
-
-    driver_exe_folder = os.path.abspath(os.path.expanduser(dirpath))
-    driver_exe_path = os.path.join(driver_exe_folder, "_".join([prefix, exe_name]))
-
-    return driver_exe_path
 
 
 def _apply_timezone_consistency_script(

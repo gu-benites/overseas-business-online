@@ -1,0 +1,11 @@
+{
+  "pid": 332996,
+  "pgid": 332996,
+  "argv": [
+    "/home/otavio/overseas-business-online/run_grouped_ad_clicker.py",
+    "--max-concurrent-groups",
+    "2",
+    "--max-runtime-minutes",
+    "270"
+  ]
+}

@@ -21,7 +21,7 @@ class WebdriverParams:
     proxy: str
     auth: Optional[bool] = False
     incognito: Optional[bool] = False
-    identity_mode: Optional[str] = "legacy"
+    identity_mode: Optional[str] = "native_linux"
     country_domain: Optional[bool] = False
     language_from_proxy: Optional[bool] = False
     ss_on_exception: Optional[bool] = False
@@ -97,7 +97,7 @@ class ConfigReader:
             proxy=config["webdriver"]["proxy"],
             auth=config["webdriver"]["auth"],
             incognito=config["webdriver"]["incognito"],
-            identity_mode=config["webdriver"].get("identity_mode", "legacy"),
+            identity_mode=config["webdriver"].get("identity_mode", "native_linux"),
             country_domain=config["webdriver"]["country_domain"],
             language_from_proxy=config["webdriver"]["language_from_proxy"],
             ss_on_exception=config["webdriver"]["ss_on_exception"],

@@ -278,7 +278,7 @@ def _cleanup_stale_uc_profile_dirs() -> None:
     )
 
 
-def _wait_until_proxy_healthy(group: GroupRecord) -> None:
+def _wait_until_proxy_healthy(group: GroupRecord) -> str:
     logger.warning(
         "Proxy returned 402 Payment Required. "
         "Will poll proxy health every "
@@ -294,12 +294,32 @@ def _wait_until_proxy_healthy(group: GroupRecord) -> None:
                 "Proxy health restored after 402 Payment Required: "
                 f"city={group.city_name}, rsw_id={group.rsw_id}, exit_ip={exit_ip}"
             )
-            return
+            return exit_ip
         logger.warning(
             "Proxy still unhealthy after 402 Payment Required. "
             f"Will retry in {PROXY_PAYMENT_REQUIRED_POLL_SECONDS} seconds: "
             f"city={group.city_name}, rsw_id={group.rsw_id}"
         )
+
+
+def _preflight_group_proxy(group: GroupRecord) -> str | None:
+    if not group.proxy:
+        return None
+
+    exit_ip = get_proxy_exit_ip(group.proxy, max_retries=2, retry_sleep_seconds=2)
+    if exit_ip:
+        logger.info(
+            "Proxy preflight succeeded before browser start: "
+            f"city={group.city_name}, rsw_id={group.rsw_id}, exit_ip={exit_ip}"
+        )
+        return exit_ip
+
+    logger.warning(
+        "Proxy preflight failed before browser start. "
+        "Will wait for proxy health before launching browser: "
+        f"city={group.city_name}, rsw_id={group.rsw_id}"
+    )
+    return _wait_until_proxy_healthy(group)
 
 def _parse_int_stat(value: str | None) -> int:
     if not value:
@@ -455,6 +475,7 @@ def _run_group_once(
     max_attempts = max(1, len(group_queries))
 
     while True:
+        _preflight_group_proxy(current_group)
         attempt_result = _run_single_group_query_attempt(
             db,
             current_group,

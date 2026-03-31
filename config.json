@@ -9,6 +9,7 @@
         "proxy": "",
         "auth": true,
         "incognito": false,
+        "identity_mode": "native_linux",
         "country_domain": true,
         "language_from_proxy": true,
         "ss_on_exception": false,
