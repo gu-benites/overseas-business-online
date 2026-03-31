@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop grouped runner on Saturday at 15:00 America/Sao_Paulo
+
+[Timer]
+OnCalendar=Sat 15:00
+AccuracySec=1min
+Unit=grouped-runner-stop.service
+
+[Install]
+WantedBy=timers.target

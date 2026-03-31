@@ -1,0 +1,10 @@
+[Unit]
+Description=Cleanup grouped runner artifacts older than retention window
+
+[Service]
+Type=oneshot
+User=gustavo
+Group=gustavo
+WorkingDirectory=/home/gustavo/overseas-business-online
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/gustavo/overseas-business-online/.venv/bin/python /home/gustavo/overseas-business-online/scripts/cleanup_old_artifacts.py --days 7

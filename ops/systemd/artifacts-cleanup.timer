@@ -1,0 +1,11 @@
+[Unit]
+Description=Run artifact cleanup after operational windows
+
+[Timer]
+OnCalendar=Mon..Fri 15:05
+OnCalendar=Sat 15:05
+AccuracySec=1min
+Unit=artifacts-cleanup.service
+
+[Install]
+WantedBy=timers.target

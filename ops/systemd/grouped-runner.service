@@ -1,0 +1,21 @@
+[Unit]
+Description=Grouped ad click runner
+Wants=network-online.target
+After=network-online.target xvfb-display-10.service
+Requires=xvfb-display-10.service
+
+[Service]
+Type=simple
+User=gustavo
+Group=gustavo
+WorkingDirectory=/home/gustavo/overseas-business-online
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:10
+Environment=XAUTHORITY=/home/gustavo/.Xauthority-xvfb-10
+ExecStart=/home/gustavo/overseas-business-online/.venv/bin/python /home/gustavo/overseas-business-online/run_grouped_ad_clicker.py --max-concurrent-groups 4
+ExecStop=/home/gustavo/overseas-business-online/.venv/bin/python /home/gustavo/overseas-business-online/scripts/stop_grouped_runner.py
+KillMode=control-group
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=20
+RuntimeMaxSec=7h15m
