@@ -44,7 +44,7 @@ from utils import (
     resolve_redirect,
     boost_requests,
 )
-from webdriver import execute_stealth_js_code
+from webdriver import execute_presearch_trust_js_code, execute_stealth_js_code
 
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
@@ -98,6 +98,38 @@ class SearchController:
     )
     LOC_CONTINUE_BUTTON = (By.TAG_NAME, "g-raised-button")
     NOT_NOW_BUTTON = (By.CSS_SELECTOR, "g-raised-button[data-ved]")
+    BUTTON_CANDIDATE_SELECTORS = (
+        (By.TAG_NAME, "button"),
+        (By.TAG_NAME, "g-raised-button"),
+        (By.CSS_SELECTOR, "[role='button']"),
+        (By.CSS_SELECTOR, "input[type='button']"),
+        (By.CSS_SELECTOR, "input[type='submit']"),
+    )
+    COOKIE_CONSENT_ACTION_PHRASES = (
+        "accept all",
+        "accept",
+        "agree",
+        "i agree",
+        "got it",
+        "alle akzeptieren",
+        "akzeptieren",
+        "ich stimme zu",
+        "alle ablehnen",
+        "ablehnen",
+        "aceitar tudo",
+        "aceitar",
+        "concordo",
+        "rejeitar tudo",
+        "rejeitar",
+        "aceptar todo",
+        "aceptar",
+        "rechazar todo",
+        "rechazar",
+        "reject all",
+        "reject",
+        "decline all",
+        "decline",
+    )
     UNRELATED_UI_BUTTON_PHRASES = (
         "upload",
         "image",
@@ -263,37 +295,12 @@ class SearchController:
         logger.info(f"Starting search for '{self._search_query}'")
         sleep(get_random_sleep(1, 2) * config.behavior.wait_factor)
 
-        try:
-            search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-            self._type_humanlike(search_input_box, self._search_query)
-
-        except ElementNotInteractableException:
-            self._check_captcha()
-            self._close_cookie_dialog()
-
-            try:
-                logger.debug("Waiting for search box to be ready...")
-
-                wait = WebDriverWait(self._driver, timeout=7)
-                searchbox_ready = wait.until(EC.element_to_be_clickable(self.SEARCH_INPUT))
-
-                if searchbox_ready:
-                    logger.debug("Search box is ready...")
-
-                    try:
-                        search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                        self._type_humanlike(search_input_box, self._search_query)
-                    except ElementNotInteractableException:
-                        pass
-
-            except TimeoutException:
-                logger.error("Timed out waiting for search box! Falling back to direct search URL.")
-                self._open_search_results_directly()
-        except NoSuchElementException:
+        if not self._submit_search_query():
             self._abort_if_google_blocked("search_input_missing")
-            logger.warning("Search input was not found. Falling back to direct search URL.")
+            logger.warning("Search input was not ready. Falling back to direct search URL.")
             self._open_search_results_directly()
 
+        self._wait_for_page_settle(timeout=6)
         self._check_captcha()
         self._abort_if_google_blocked("after_query_submit")
 
@@ -302,15 +309,16 @@ class SearchController:
 
         if not self._results_page_ready():
             self._close_cookie_dialog()
-
-            try:
-                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                if not search_input_box.get_attribute("value"):
-                    logger.debug(f"Reentering search query '{self._search_query}'")
-                    self._type_humanlike(search_input_box, self._search_query)
-                    sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
-            except NoSuchElementException:
-                logger.debug("Search input is not available after direct search fallback.")
+            if not self._results_page_ready():
+                if not self._submit_search_query():
+                    logger.warning(
+                        "Results are still not ready after retrying the homepage search box. "
+                        "Falling back to direct search URL."
+                    )
+                    self._open_search_results_directly()
+                self._check_captcha()
+                self._abort_if_google_blocked("after_retry_submit")
+                sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
 
         if self._hooks_enabled:
             hooks.after_query_sent_hook(self._driver, self._search_query)
@@ -901,6 +909,189 @@ class SearchController:
             pass
         raise BrowserSessionUnavailableError(str(exp)) from exp
 
+    def _collect_element_ui_strings(
+        self, element: selenium.webdriver.remote.webelement.WebElement
+    ) -> list[str]:
+        values: list[str] = []
+        for attribute_name in ("aria-label", "title", "value", "id", "name", "class"):
+            try:
+                attribute_value = element.get_attribute(attribute_name)
+            except StaleElementReferenceException:
+                return []
+            if attribute_value:
+                values.append(attribute_value)
+
+        try:
+            text_value = element.text
+        except StaleElementReferenceException:
+            return values
+        if text_value:
+            values.append(text_value)
+
+        normalized_values: list[str] = []
+        for value in values:
+            normalized = self._normalize_ui_text(value)
+            if normalized and normalized not in normalized_values:
+                normalized_values.append(normalized)
+
+        return normalized_values
+
+    def _iter_visible_button_candidates(self):
+        seen_ids: set[str] = set()
+
+        for selector in self.BUTTON_CANDIDATE_SELECTORS:
+            try:
+                candidates = self._driver.find_elements(*selector)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("button_candidate_scan", exp)
+                raise
+
+            for candidate in candidates:
+                candidate_id = getattr(candidate, "id", None)
+                if candidate_id and candidate_id in seen_ids:
+                    continue
+                if candidate_id:
+                    seen_ids.add(candidate_id)
+
+                try:
+                    if not candidate.is_displayed() or not candidate.is_enabled():
+                        continue
+                except StaleElementReferenceException:
+                    continue
+                except Exception as exp:
+                    if self._is_browser_session_unavailable_exception(exp):
+                        self._abort_due_to_browser_unavailable(
+                            "button_candidate_visibility_check",
+                            exp,
+                        )
+                    raise
+
+                yield candidate
+
+    def _find_best_button_candidate(
+        self,
+        positive_phrases: tuple[str, ...],
+        *,
+        negative_phrases: tuple[str, ...] = (),
+    ) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        normalized_positive = tuple(self._normalize_ui_text(phrase) for phrase in positive_phrases)
+        normalized_negative = tuple(self._normalize_ui_text(phrase) for phrase in negative_phrases)
+        best_candidate = None
+        best_score = 0
+
+        for candidate in self._iter_visible_button_candidates():
+            ui_strings = self._collect_element_ui_strings(candidate)
+            if not ui_strings:
+                continue
+
+            combined_text = " | ".join(ui_strings)
+            if any(
+                negative_phrase and negative_phrase in combined_text
+                for negative_phrase in normalized_negative
+            ):
+                continue
+
+            score = 0
+            for positive_phrase in normalized_positive:
+                if not positive_phrase:
+                    continue
+                for ui_string in ui_strings:
+                    if ui_string == positive_phrase:
+                        score = max(score, 100 + len(positive_phrase))
+                    elif positive_phrase in ui_string:
+                        score = max(score, len(positive_phrase))
+
+            if score > best_score:
+                best_candidate = candidate
+                best_score = score
+
+        return best_candidate
+
+    def _click_ui_element(
+        self,
+        element: selenium.webdriver.remote.webelement.WebElement,
+        *,
+        stage: str,
+    ) -> None:
+        try:
+            self._driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                element,
+            )
+            sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable(stage, exp)
+
+        try:
+            element.click()
+        except ElementClickInterceptedException:
+            try:
+                self._driver.execute_script("arguments[0].click();", element)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable(stage, exp)
+                raise
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable(stage, exp)
+            raise
+
+    def _page_has_google_consent_surface(self) -> bool:
+        current_url = (self._driver.current_url or "").lower()
+        if "consent.google" in current_url or "consent.youtube" in current_url:
+            return True
+
+        try:
+            policy_links = self._driver.find_elements(By.CSS_SELECTOR, "a[href*='policies.google']")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("consent_surface_detection", exp)
+            raise
+
+        return bool(policy_links)
+
+    def _find_interactable_search_input(
+        self, timeout: int = 0
+    ) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        def _locate(_driver):
+            for element in self._driver.find_elements(*self.SEARCH_INPUT):
+                try:
+                    if element.is_displayed() and element.is_enabled():
+                        return element
+                except StaleElementReferenceException:
+                    continue
+            return False
+
+        if timeout <= 0:
+            located = _locate(None)
+            return located or None
+
+        try:
+            return WebDriverWait(self._driver, timeout).until(_locate)
+        except TimeoutException:
+            return None
+
+    def _submit_search_query(self) -> bool:
+        search_input_box = self._find_interactable_search_input(timeout=3)
+        if not search_input_box:
+            logger.debug("Search input is not visible and interactable.")
+            return False
+
+        try:
+            self._driver.execute_script("arguments[0].focus();", search_input_box)
+            search_input_box.click()
+            return self._type_humanlike(search_input_box, self._search_query)
+        except (ElementNotInteractableException, StaleElementReferenceException) as exp:
+            logger.debug(f"Search input could not be used for typing: {exp}")
+            return False
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("search_query_submission", exp)
+            logger.debug(f"Search query submission failed: {exp}")
+            return False
+
     def _get_wait_time(self, is_ad_element: bool) -> int:
         """Get wait time based on whether the link is an ad or non-ad
 
@@ -992,6 +1183,7 @@ class SearchController:
     def _load(self) -> None:
         """Load Google main page"""
 
+        execute_presearch_trust_js_code(self._driver)
         if config.webdriver.use_seleniumbase:
             self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
         else:
@@ -1294,7 +1486,7 @@ class SearchController:
 
         return non_ad_links
 
-    def _close_cookie_dialog(self) -> None:
+    def _close_cookie_dialog(self) -> bool:
         """If cookie dialog is opened, close it by accepting"""
 
         logger.debug("Waiting for cookie dialog...")
@@ -1302,63 +1494,51 @@ class SearchController:
         sleep(get_random_sleep(3, 3.5) * config.behavior.wait_factor)
 
         try:
-            all_links = [
-                element.get_attribute("href")
-                for element in self._driver.find_elements(By.TAG_NAME, "a")
-                if isinstance(element.get_attribute("href"), str)
-            ]
-        except WebDriverException as exp:
-            exp_text = str(exp).lower()
-            if "invalid session id" in exp_text or "tab crashed" in exp_text or "disconnected" in exp_text:
-                logger.error(
-                    "Browser session became unavailable while checking cookie dialog. "
-                    "Stopping this run cleanly."
-                )
-                raise SystemExit()
+            consent_surface_present = self._page_has_google_consent_surface()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("cookie_dialog_detection", exp)
             raise
 
-        for link in all_links:
-            if "policies.google.com" in link:
-                buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)[6:-2]
-                if len(buttons) < 6:
-                    buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)
-
-                for button in buttons:
-                    try:
-                        if (
-                            button.get_attribute("role") != "link"
-                            and button.get_attribute("style") != "display:none"
-                        ):
-                            logger.debug(f"Clicking button {button.get_attribute('outerHTML')}")
-                            self._driver.execute_script(
-                                "arguments[0].scrollIntoView(true);", button
-                            )
-                            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
-                            button.click()
-                            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-
-                            try:
-                                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                                if not search_input_box.get_attribute("value"):
-                                    self._type_humanlike(search_input_box, self._search_query)
-                                    break
-                            except (
-                                ElementNotInteractableException,
-                                StaleElementReferenceException,
-                            ):
-                                pass
-
-                    except (
-                        ElementNotInteractableException,
-                        ElementClickInterceptedException,
-                        StaleElementReferenceException,
-                    ):
-                        pass
-
-                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-                break
-        else:
+        if not consent_surface_present:
             logger.debug("No cookie dialog found! Continue with search...")
+            return False
+
+        consent_handled = False
+
+        for attempt in range(3):
+            button = self._find_best_button_candidate(
+                self.COOKIE_CONSENT_ACTION_PHRASES,
+                negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+            )
+            if not button:
+                if not consent_handled:
+                    logger.debug("No recognizable cookie consent action button was found.")
+                break
+
+            try:
+                logger.debug(f"Clicking button {button.get_attribute('outerHTML')}")
+            except Exception:
+                logger.debug("Clicking cookie consent action button.")
+
+            try:
+                self._click_ui_element(button, stage=f"cookie_dialog_click_{attempt + 1}")
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+            ) as exp:
+                logger.debug(f"Cookie consent button interaction failed: {exp}")
+                continue
+
+            consent_handled = True
+            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+            self._wait_for_page_settle(timeout=4)
+
+            if not self._page_has_google_consent_surface():
+                break
+
+        return consent_handled
 
     def _is_scroll_at_the_end(self) -> bool:
         """Check if scroll is at the end
@@ -1930,7 +2110,7 @@ class SearchController:
 
     def _type_humanlike(
         self, element: selenium.webdriver.remote.webelement.WebElement, text: str
-    ) -> None:
+    ) -> bool:
         """Type text slowly like a human
 
         :type element: selenium.webdriver.remote.webelement.WebElement
@@ -1947,9 +2127,11 @@ class SearchController:
                 sleep(get_random_sleep(0.05, 0.15) * config.behavior.wait_factor)
 
             element.send_keys(Keys.ENTER)
+            return True
 
         except Exception as exp:
             logger.debug(f"Error while typing: {exp}")
+            return False
 
     def set_browser_id(self, browser_id: Optional[int] = None) -> None:
         """Set browser id in stats if multiple browsers are used

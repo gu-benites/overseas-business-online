@@ -3,6 +3,7 @@ import platform
 import random
 import string
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from time import sleep
@@ -54,6 +55,76 @@ from utils import get_location, get_locale_language, get_random_sleep
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _bootstrap_linux_display() -> None:
+    """Attach CLI-launched runs to the persistent desktop display when available."""
+
+    if not sys.platform.startswith("linux"):
+        return
+
+    x_socket = Path("/tmp/.X11-unix/X10")
+    if not os.environ.get("DISPLAY") and x_socket.exists():
+        os.environ["DISPLAY"] = ":10"
+
+    if os.environ.get("DISPLAY") == ":10" and not os.environ.get("XAUTHORITY"):
+        xauthority_path = Path.home() / ".Xauthority-xvfb-10"
+        if xauthority_path.exists():
+            os.environ["XAUTHORITY"] = str(xauthority_path)
+
+
+_bootstrap_linux_display()
+
+
+def _build_accept_language_header(locale_code: Optional[str]) -> Optional[str]:
+    normalized_locale = str(locale_code or "").strip()
+    if not normalized_locale:
+        return None
+
+    primary_language = normalized_locale.split("-", 1)[0].strip()
+    ordered_values: list[str] = []
+    for candidate in (normalized_locale, primary_language, "en-US", "en"):
+        if candidate and candidate not in ordered_values:
+            ordered_values.append(candidate)
+
+    return ",".join(ordered_values)
+
+
+def _resolve_proxy_locale(country_code: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    locale_code = get_locale_language(country_code)
+    normalized_locale = str(locale_code or "").strip()
+    if not normalized_locale:
+        return None, None
+
+    accept_language = _build_accept_language_header(normalized_locale)
+    logger.debug(
+        "Resolved proxy locale settings: "
+        f"country_code={country_code}, locale={normalized_locale}, "
+        f"accept_language={accept_language}"
+    )
+    return normalized_locale, accept_language
+
+
+def _apply_browser_locale_overrides(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+    *,
+    accept_language: Optional[str],
+) -> None:
+    if not accept_language:
+        return
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception as exp:
+        logger.debug(f"Failed to enable CDP Network domain for locale override: {exp}")
+
+    try:
+        driver.execute_cdp_cmd(
+            "Network.setExtraHTTPHeaders",
+            {"headers": {"Accept-Language": accept_language}},
+        )
+    except Exception as exp:
+        logger.debug(f"Failed to set Accept-Language header override: {exp}")
 
 
 def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
@@ -358,6 +429,13 @@ def create_webdriver(
     headless_fallback = sys.platform.startswith("linux") and not has_display
 
     chrome_options = undetected_chromedriver.ChromeOptions()
+    chrome_prefs = {
+        "webrtc.ip_handling_policy": "disable_non_proxied_udp",
+        "webrtc.multiple_routes_enabled": False,
+        "webrtc.nonproxied_udp_enabled": False,
+    }
+    locale_code = None
+    accept_language = None
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--no-first-run")
     chrome_options.add_argument("--no-service-autorun")
@@ -404,18 +482,9 @@ def create_webdriver(
         "DownloadBubble",
         "DownloadBubbleV2",
         "PrivacySandboxSettings4",
-        "UserAgentClientHint",
         "DisableLoadExtensionCommandLineSwitch",
     ]
     chrome_options.add_argument(f"--disable-features={','.join(disabled_features)}")
-
-    # disable WebRTC IP tracking
-    webrtc_preferences = {
-        "webrtc.ip_handling_policy": "disable_non_proxied_udp",
-        "webrtc.multiple_routes_enabled": False,
-        "webrtc.nonproxied_udp_enabled": False,
-    }
-    chrome_options.add_experimental_option("prefs", webrtc_preferences)
 
     if config.webdriver.incognito:
         chrome_options.add_argument("--incognito")
@@ -475,18 +544,26 @@ def create_webdriver(
                     f"{country_code}"
                 )
         if config.webdriver.language_from_proxy:
-            lang = get_locale_language(country_code)
-            chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
-            chrome_options.add_argument(f"--lang={lang[:2]}")
+            locale_code, accept_language = _resolve_proxy_locale(country_code)
+            if accept_language:
+                chrome_prefs["intl.accept_languages"] = accept_language
+            if locale_code:
+                chrome_options.add_argument(f"--lang={locale_code}")
 
-        driver = CustomChrome(
-            browser_executable_path=browser_binary_path,
-            driver_executable_path=driver_exe_path,
-            options=chrome_options,
-            user_multi_procs=multi_procs_enabled,
-            use_subprocess=True,
-        )
+    chrome_options.add_experimental_option("prefs", chrome_prefs)
 
+    driver = CustomChrome(
+        browser_executable_path=browser_binary_path,
+        driver_executable_path=driver_exe_path,
+        options=chrome_options,
+        user_multi_procs=multi_procs_enabled,
+        use_subprocess=True,
+    )
+
+    if locale_code or accept_language:
+        _apply_browser_locale_overrides(driver, accept_language=accept_language)
+
+    if proxy:
         accuracy = 95
 
         # set geolocation and timezone of the browser according to IP address
@@ -512,18 +589,11 @@ def create_webdriver(
                 timezone_proxy_label = proxy
             logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
         driver._active_proxy = proxy
-        driver._runtime_profile_dir = profile_dir
 
     else:
-        driver = CustomChrome(
-            browser_executable_path=browser_binary_path,
-            driver_executable_path=driver_exe_path,
-            options=chrome_options,
-            user_multi_procs=multi_procs_enabled,
-            use_subprocess=True,
-        )
         driver._active_proxy = None
-        driver._runtime_profile_dir = profile_dir
+
+    driver._runtime_profile_dir = profile_dir
 
     if headless_fallback:
         logger.debug("Skipping window maximize/position because Chrome is running headless.")
@@ -567,6 +637,8 @@ def create_seleniumbase_driver(
     headless_fallback = sys.platform.startswith("linux") and not has_display
 
     country_code = None
+    locale_code = None
+    accept_language = None
 
     if proxy:
         if config.webdriver.auth:
@@ -588,7 +660,7 @@ def create_seleniumbase_driver(
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
 
         if config.webdriver.language_from_proxy:
-            lang = get_locale_language(country_code)
+            locale_code, accept_language = _resolve_proxy_locale(country_code)
 
     driver = seleniumbase.get_driver(
         browser_name="chrome",
@@ -599,11 +671,14 @@ def create_seleniumbase_driver(
         proxy_string=proxy or None,
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
-        locale_code=str(lang) if config.webdriver.language_from_proxy else None,
+        locale_code=locale_code if config.webdriver.language_from_proxy else None,
         binary_location=browser_binary_path,
         no_sandbox=True,
         disable_gpu=True,
     )
+
+    if locale_code or accept_language:
+        _apply_browser_locale_overrides(driver, accept_language=accept_language)
 
     # set geolocation and timezone if available
     if proxy and lat and long:
@@ -737,8 +812,96 @@ def _get_driver_exe_path() -> str:
     return driver_exe_path
 
 
+def _apply_timezone_consistency_script(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+) -> None:
+    """Keep timezone JS surfaces aligned with the CDP timezone override."""
+
+    timezone = getattr(driver, "_custom_timezone", None)
+    if not timezone:
+        return
+
+    driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+
+    timezone_js = f"""
+    (() => {{
+        const tz = "{timezone}";
+        const getOffset = (tzName) => {{
+            try {{
+                const now = new Date();
+                const local = new Date(now.toLocaleString("en-US", {{ timeZone: tzName }}));
+                const utc = new Date(now.toLocaleString("en-US", {{ timeZone: "UTC" }}));
+                return (utc - local) / 60000; // minutes
+            }} catch (e) {{
+                return 0;
+            }}
+        }};
+        const offset = getOffset(tz);
+        const sign = offset <= 0 ? "+" : "-";
+        const absOffset = Math.abs(offset);
+        const hours = String(Math.floor(absOffset / 60)).padStart(2, "0");
+        const minutes = String(Math.abs(offset) % 60).padStart(2, "0");
+        const gmtString = `GMT${{sign}}${{hours}}${{minutes}}`;
+
+        const origIntl = Intl.DateTimeFormat.prototype.resolvedOptions;
+        Intl.DateTimeFormat.prototype.resolvedOptions = function() {{
+            const opts = origIntl.call(this);
+            opts.timeZone = tz;
+            return opts;
+        }};
+
+        const origOffset = Date.prototype.getTimezoneOffset;
+        Date.prototype.getTimezoneOffset = function() {{ return offset; }};
+
+        const origToString = Date.prototype.toString;
+        Date.prototype.toString = function() {{
+            const str = origToString.call(this);
+            return str.replace(/GMT[+-]\\d{{4}}.*$/, `${{gmtString}} (${{tz}})`);
+        }};
+
+        const origLocale = Date.prototype.toLocaleString;
+        Date.prototype.toLocaleString = function(...args) {{
+            const opts = args[1] || {{}};
+            if (!opts.timeZone) opts.timeZone = tz;
+            return origLocale.call(this, args[0] || undefined, opts);
+        }};
+
+        const fakeNative = (n) => `function ${{n}}() {{ [native code] }}`;
+        [
+            Date.prototype.getTimezoneOffset,
+            Date.prototype.toString,
+            Date.prototype.toLocaleString,
+            Intl.DateTimeFormat.prototype.resolvedOptions
+        ].forEach(fn => {{
+            if (fn && fn.name)
+                Object.defineProperty(fn, "toString", {{ value: () => fakeNative(fn.name) }});
+        }});
+
+        Object.defineProperty(Intl, "DateTimeFormat", {{
+            value: new Proxy(Intl.DateTimeFormat, {{
+                construct(target, args) {{
+                    if (args[1] && args[1].timeZone)
+                        args[1].timeZone = tz;
+                    return new target(...args);
+                }}
+            }})
+        }});
+    }})();
+    """
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": timezone_js})
+
+
+def execute_presearch_trust_js_code(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+) -> None:
+    """Inject only the minimum consistency patches needed before loading Google."""
+
+    _apply_timezone_consistency_script(driver)
+    logger.debug("Applied minimal pre-search trust JavaScript.")
+
+
 def execute_stealth_js_code(driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver]):
-    """Execute the stealth JS code to prevent detection
+    """Execute the aggressive post-search stealth JS code for landing-page browsing.
 
     Signature changes can be tested by loading the following addresses
     - https://browserleaks.com/canvas
@@ -754,82 +917,7 @@ def execute_stealth_js_code(driver: Union[undetected_chromedriver.Chrome, seleni
     :param driver: WebDriver instance
     """
 
-    # timezone spoofing and normalization
-    timezone = getattr(driver, "_custom_timezone", None)
-
-    if timezone:
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
-        timezone_js = f"""
-        (() => {{
-            const tz = "{timezone}";
-            const getOffset = (tzName) => {{
-                try {{
-                    const now = new Date();
-                    const local = new Date(now.toLocaleString("en-US", {{ timeZone: tzName }}));
-                    const utc = new Date(now.toLocaleString("en-US", {{ timeZone: "UTC" }}));
-                    return (utc - local) / 60000; // minutes
-                }} catch (e) {{
-                    return 0;
-                }}
-            }};
-            const offset = getOffset(tz);
-            const sign = offset <= 0 ? "+" : "-";
-            const absOffset = Math.abs(offset);
-            const hours = String(Math.floor(absOffset / 60)).padStart(2, "0");
-            const minutes = String(Math.abs(offset) % 60).padStart(2, "0");
-            const gmtString = `GMT${{sign}}${{hours}}${{minutes}}`;
-
-            // Patch Intl
-            const origIntl = Intl.DateTimeFormat.prototype.resolvedOptions;
-            Intl.DateTimeFormat.prototype.resolvedOptions = function() {{
-                const opts = origIntl.call(this);
-                opts.timeZone = tz;
-                return opts;
-            }};
-
-            // Patch Date
-            const origOffset = Date.prototype.getTimezoneOffset;
-            Date.prototype.getTimezoneOffset = function() {{ return offset; }};
-
-            const origToString = Date.prototype.toString;
-            Date.prototype.toString = function() {{
-                const str = origToString.call(this);
-                return str.replace(/GMT[+-]\\d{{4}}.*$/, `${{gmtString}} (${{tz}})`);
-            }};
-
-            const origLocale = Date.prototype.toLocaleString;
-            Date.prototype.toLocaleString = function(...args) {{
-                const opts = args[1] || {{}};
-                if (!opts.timeZone) opts.timeZone = tz;
-                return origLocale.call(this, args[0] || undefined, opts);
-            }};
-
-            // Hide modifications
-            const fakeNative = (n) => `function ${{n}}() {{ [native code] }}`;
-            [
-                Date.prototype.getTimezoneOffset,
-                Date.prototype.toString,
-                Date.prototype.toLocaleString,
-                Intl.DateTimeFormat.prototype.resolvedOptions
-            ].forEach(fn => {{
-                if (fn && fn.name)
-                    Object.defineProperty(fn, "toString", {{ value: () => fakeNative(fn.name) }});
-            }});
-
-            // Proxy Intl.DateTimeFormat constructor for consistency
-            Object.defineProperty(Intl, "DateTimeFormat", {{
-                value: new Proxy(Intl.DateTimeFormat, {{
-                    construct(target, args) {{
-                        if (args[1] && args[1].timeZone)
-                            args[1].timeZone = tz;
-                        return new target(...args);
-                    }}
-                }})
-            }});
-        }})();
-        """
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": timezone_js})
+    execute_presearch_trust_js_code(driver)
 
     # DevTools detection prevention
     devtools_evasion_js = """
