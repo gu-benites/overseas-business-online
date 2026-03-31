@@ -92,15 +92,17 @@ def get_random_user_agent_string() -> Optional[str]:
         ]
 
     elif current_os == "Linux":
-        filtered_user_agents = [ua for ua in all_user_agents if "X11; Linux x86_64" in ua]
-
-        if not filtered_user_agents:
-            filtered_user_agents = [
-                ua for ua in all_user_agents if "Linux" in ua and "Android" not in ua
-            ]
+        filtered_user_agents = [
+            ua
+            for ua in all_user_agents
+            if "Linux" in ua and "Android" not in ua and "Mobile" not in ua
+        ]
 
     else:
         # fallback to all agents if no matching OS found
+        filtered_user_agents = all_user_agents
+
+    if not filtered_user_agents:
         filtered_user_agents = all_user_agents
 
     user_agent_string = random.choice(filtered_user_agents)

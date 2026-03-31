@@ -571,7 +571,6 @@ def create_webdriver(
         "DownloadBubble",
         "DownloadBubbleV2",
         "PrivacySandboxSettings4",
-        "UserAgentClientHint",
         "DisableLoadExtensionCommandLineSwitch",
     ]
     chrome_options.add_argument(f"--disable-features={','.join(disabled_features)}")
@@ -958,8 +957,97 @@ def _get_driver_exe_path() -> str:
     return driver_exe_path
 
 
+def _apply_timezone_consistency_script(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+) -> None:
+    """Inject only the timezone consistency patches needed before Google loads."""
+
+    timezone = getattr(driver, "_custom_timezone", None)
+
+    if not timezone:
+        return
+
+    driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+
+    timezone_js = f"""
+    (() => {{
+        const tz = "{timezone}";
+        const getOffset = (tzName) => {{
+            try {{
+                const now = new Date();
+                const local = new Date(now.toLocaleString("en-US", {{ timeZone: tzName }}));
+                const utc = new Date(now.toLocaleString("en-US", {{ timeZone: "UTC" }}));
+                return (utc - local) / 60000; // minutes
+            }} catch (e) {{
+                return 0;
+            }}
+        }};
+        const offset = getOffset(tz);
+        const sign = offset <= 0 ? "+" : "-";
+        const absOffset = Math.abs(offset);
+        const hours = String(Math.floor(absOffset / 60)).padStart(2, "0");
+        const minutes = String(Math.abs(offset) % 60).padStart(2, "0");
+        const gmtString = `GMT${{sign}}${{hours}}${{minutes}}`;
+
+        const origIntl = Intl.DateTimeFormat.prototype.resolvedOptions;
+        Intl.DateTimeFormat.prototype.resolvedOptions = function() {{
+            const opts = origIntl.call(this);
+            opts.timeZone = tz;
+            return opts;
+        }};
+
+        const origOffset = Date.prototype.getTimezoneOffset;
+        Date.prototype.getTimezoneOffset = function() {{ return offset; }};
+
+        const origToString = Date.prototype.toString;
+        Date.prototype.toString = function() {{
+            const str = origToString.call(this);
+            return str.replace(/GMT[+-]\\d{{4}}.*$/, `${{gmtString}} (${{tz}})`);
+        }};
+
+        const origLocale = Date.prototype.toLocaleString;
+        Date.prototype.toLocaleString = function(...args) {{
+            const opts = args[1] || {{}};
+            if (!opts.timeZone) opts.timeZone = tz;
+            return origLocale.call(this, args[0] || undefined, opts);
+        }};
+
+        const fakeNative = (n) => `function ${{n}}() {{ [native code] }}`;
+        [
+            Date.prototype.getTimezoneOffset,
+            Date.prototype.toString,
+            Date.prototype.toLocaleString,
+            Intl.DateTimeFormat.prototype.resolvedOptions
+        ].forEach(fn => {{
+            if (fn && fn.name)
+                Object.defineProperty(fn, "toString", {{ value: () => fakeNative(fn.name) }});
+        }});
+
+        Object.defineProperty(Intl, "DateTimeFormat", {{
+            value: new Proxy(Intl.DateTimeFormat, {{
+                construct(target, args) {{
+                    if (args[1] && args[1].timeZone)
+                        args[1].timeZone = tz;
+                    return new target(...args);
+                }}
+            }})
+        }});
+    }})();
+    """
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": timezone_js})
+
+
+def execute_presearch_trust_js_code(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+) -> None:
+    """Inject only the minimum consistency patches needed before loading Google."""
+
+    _apply_timezone_consistency_script(driver)
+    logger.debug("Applied minimal pre-search trust JavaScript.")
+
+
 def execute_stealth_js_code(driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver]):
-    """Execute the stealth JS code to prevent detection
+    """Execute the aggressive post-search stealth JS code for landing-page browsing.
 
     Signature changes can be tested by loading the following addresses
     - https://browserleaks.com/canvas
@@ -975,82 +1063,7 @@ def execute_stealth_js_code(driver: Union[undetected_chromedriver.Chrome, seleni
     :param driver: WebDriver instance
     """
 
-    # timezone spoofing and normalization
-    timezone = getattr(driver, "_custom_timezone", None)
-
-    if timezone:
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
-        timezone_js = f"""
-        (() => {{
-            const tz = "{timezone}";
-            const getOffset = (tzName) => {{
-                try {{
-                    const now = new Date();
-                    const local = new Date(now.toLocaleString("en-US", {{ timeZone: tzName }}));
-                    const utc = new Date(now.toLocaleString("en-US", {{ timeZone: "UTC" }}));
-                    return (utc - local) / 60000; // minutes
-                }} catch (e) {{
-                    return 0;
-                }}
-            }};
-            const offset = getOffset(tz);
-            const sign = offset <= 0 ? "+" : "-";
-            const absOffset = Math.abs(offset);
-            const hours = String(Math.floor(absOffset / 60)).padStart(2, "0");
-            const minutes = String(Math.abs(offset) % 60).padStart(2, "0");
-            const gmtString = `GMT${{sign}}${{hours}}${{minutes}}`;
-
-            // Patch Intl
-            const origIntl = Intl.DateTimeFormat.prototype.resolvedOptions;
-            Intl.DateTimeFormat.prototype.resolvedOptions = function() {{
-                const opts = origIntl.call(this);
-                opts.timeZone = tz;
-                return opts;
-            }};
-
-            // Patch Date
-            const origOffset = Date.prototype.getTimezoneOffset;
-            Date.prototype.getTimezoneOffset = function() {{ return offset; }};
-
-            const origToString = Date.prototype.toString;
-            Date.prototype.toString = function() {{
-                const str = origToString.call(this);
-                return str.replace(/GMT[+-]\\d{{4}}.*$/, `${{gmtString}} (${{tz}})`);
-            }};
-
-            const origLocale = Date.prototype.toLocaleString;
-            Date.prototype.toLocaleString = function(...args) {{
-                const opts = args[1] || {{}};
-                if (!opts.timeZone) opts.timeZone = tz;
-                return origLocale.call(this, args[0] || undefined, opts);
-            }};
-
-            // Hide modifications
-            const fakeNative = (n) => `function ${{n}}() {{ [native code] }}`;
-            [
-                Date.prototype.getTimezoneOffset,
-                Date.prototype.toString,
-                Date.prototype.toLocaleString,
-                Intl.DateTimeFormat.prototype.resolvedOptions
-            ].forEach(fn => {{
-                if (fn && fn.name)
-                    Object.defineProperty(fn, "toString", {{ value: () => fakeNative(fn.name) }});
-            }});
-
-            // Proxy Intl.DateTimeFormat constructor for consistency
-            Object.defineProperty(Intl, "DateTimeFormat", {{
-                value: new Proxy(Intl.DateTimeFormat, {{
-                    construct(target, args) {{
-                        if (args[1] && args[1].timeZone)
-                            args[1].timeZone = tz;
-                        return new target(...args);
-                    }}
-                }})
-            }});
-        }})();
-        """
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": timezone_js})
+    execute_presearch_trust_js_code(driver)
 
     # DevTools detection prevention
     devtools_evasion_js = """

@@ -44,7 +44,7 @@ from utils import (
     resolve_redirect,
     boost_requests,
 )
-from webdriver import execute_stealth_js_code
+from webdriver import execute_presearch_trust_js_code, execute_stealth_js_code
 
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
@@ -977,6 +977,7 @@ class SearchController:
     def _load(self) -> None:
         """Load Google main page"""
 
+        execute_presearch_trust_js_code(self._driver)
         if config.webdriver.use_seleniumbase:
             self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
         else:
