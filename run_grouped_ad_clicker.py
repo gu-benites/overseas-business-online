@@ -89,6 +89,8 @@ def _parse_ad_clicker_stats(output: str) -> tuple[dict[str, str], dict[str, obje
                     ),
                     "Ads Found": str(payload.get("ads_found", "")),
                     "Ads Clicked": str(payload.get("ads_clicked", "")),
+                    "Shopping Ads Found": str(payload.get("shopping_ads_found", "")),
+                    "Shopping Ads Clicked": str(payload.get("shopping_ads_clicked", "")),
                 },
                 payload,
             )
@@ -299,13 +301,25 @@ def _wait_until_proxy_healthy(group: GroupRecord) -> None:
             f"city={group.city_name}, rsw_id={group.rsw_id}"
         )
 
+def _parse_int_stat(value: str | None) -> int:
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
-def _run_group_once(
+
+def _is_yes_stat(value: str | None) -> bool:
+    return (value or "").strip().lower() == "yes"
+
+
+def _run_single_group_query_attempt(
     db: GroupsDB,
     group: GroupRecord,
     query: GroupQueryRecord,
     grouped_cycle_id: str | None = None,
-) -> None:
+) -> dict[str, object]:
     logger.info(
         "Running group: "
         f"city={group.city_name}, rsw_id={group.rsw_id}, "
@@ -352,6 +366,8 @@ def _run_group_once(
     proxy_tunnel_failed = stats.get("Proxy Tunnel Failed")
     ads_found = stats.get("Ads Found")
     ads_clicked = stats.get("Ads Clicked")
+    shopping_ads_found = stats.get("Shopping Ads Found")
+    shopping_ads_clicked = stats.get("Shopping Ads Clicked")
 
     notes = f"city={group.city_name}, rsw_id={group.rsw_id}, returncode={result.returncode}"
     if summary_payload:
@@ -391,6 +407,8 @@ def _run_group_once(
         f"latest_proxy_ip={latest_proxy_ip or '-'}, "
         f"ip_changed_mid_session={ip_changed_mid_session or '-'}, "
         f"ads_found={ads_found or '-'}, ads_clicked={ads_clicked or '-'}, "
+        f"shopping_ads_found={shopping_ads_found or '-'}, "
+        f"shopping_ads_clicked={shopping_ads_clicked or '-'}, "
         f"captcha_seen={captcha_seen or '-'}, "
         f"captcha_token_received={captcha_token_received or '-'}, "
         f"captcha_token_applied={captcha_token_applied or '-'}, "
@@ -405,6 +423,74 @@ def _run_group_once(
         or (summary_payload and summary_payload.get("proxy_tunnel_connection_failed"))
     ):
         _wait_until_proxy_healthy(group)
+
+    clickable_ads_found = _parse_int_stat(ads_found) + _parse_int_stat(shopping_ads_found)
+    return {
+        "status": status,
+        "query": query,
+        "output": output,
+        "summary_payload": summary_payload,
+        "clickable_ads_found": clickable_ads_found,
+        "ads_clicked": _parse_int_stat(ads_clicked),
+        "shopping_ads_clicked": _parse_int_stat(shopping_ads_clicked),
+        "proxy_tunnel_failed": _is_yes_stat(proxy_tunnel_failed)
+        or bool(summary_payload and summary_payload.get("proxy_tunnel_connection_failed")),
+        "google_blocked_after_captcha": _is_yes_stat(google_blocked_after_captcha)
+        or bool(summary_payload and summary_payload.get("google_blocked_after_captcha")),
+        "ip_changed_mid_session": _is_yes_stat(ip_changed_mid_session)
+        or bool(summary_payload and summary_payload.get("ip_changed_mid_session")),
+    }
+
+
+def _run_group_once(
+    db: GroupsDB,
+    group: GroupRecord,
+    query: GroupQueryRecord,
+    grouped_cycle_id: str | None = None,
+) -> None:
+    group_queries = db.get_group_queries(group.id)
+    attempted_positions: set[int] = set()
+    current_group = group
+    current_query = query
+    max_attempts = max(1, len(group_queries))
+
+    while True:
+        attempt_result = _run_single_group_query_attempt(
+            db,
+            current_group,
+            current_query,
+            grouped_cycle_id=grouped_cycle_id,
+        )
+        attempted_positions.add(current_query.position)
+
+        should_retry_same_group = (
+            attempt_result["status"] == "completed"
+            and not attempt_result["proxy_tunnel_failed"]
+            and not attempt_result["google_blocked_after_captcha"]
+            and not attempt_result["ip_changed_mid_session"]
+            and int(attempt_result["clickable_ads_found"]) == 0
+            and len(attempted_positions) < max_attempts
+        )
+        if not should_retry_same_group:
+            return
+
+        next_query = db.get_next_query_for_group(group.id)
+        if not next_query or next_query.position in attempted_positions:
+            logger.info(
+                "Grouped runner exhausted same-group query fallback without finding clickable ads: "
+                f"city={group.city_name}, rsw_id={group.rsw_id}, attempted_queries={len(attempted_positions)}"
+            )
+            return
+
+        refreshed_group = db.get_group(group.id) or current_group
+        logger.info(
+            "No clickable ads found for current group query. Retrying next query in the same group: "
+            f"city={group.city_name}, rsw_id={group.rsw_id}, "
+            f"previous_query='{current_query.query_text}', next_query='{next_query.query_text}', "
+            f"attempt={len(attempted_positions) + 1}/{max_attempts}"
+        )
+        current_group = refreshed_group
+        current_query = next_query
 
 
 def _resolve_max_concurrent_groups(cli_value: int | None) -> int:

@@ -512,6 +512,7 @@ def create_webdriver(
                 timezone_proxy_label = proxy
             logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
         driver._active_proxy = proxy
+        driver._runtime_profile_dir = profile_dir
 
     else:
         driver = CustomChrome(
@@ -522,6 +523,7 @@ def create_webdriver(
             use_subprocess=True,
         )
         driver._active_proxy = None
+        driver._runtime_profile_dir = profile_dir
 
     if headless_fallback:
         logger.debug("Skipping window maximize/position because Chrome is running headless.")
