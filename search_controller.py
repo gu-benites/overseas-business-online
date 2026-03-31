@@ -93,6 +93,48 @@ class SearchController:
     )
     LOC_CONTINUE_BUTTON = (By.TAG_NAME, "g-raised-button")
     NOT_NOW_BUTTON = (By.CSS_SELECTOR, "g-raised-button[data-ved]")
+    UNRELATED_UI_BUTTON_PHRASES = (
+        "upload",
+        "image",
+        "bild",
+        "imagem",
+        "file",
+        "datei",
+        "arquivo",
+        "language",
+        "sprache",
+        "idioma",
+        "search",
+        "google suche",
+        "google search",
+        "pesquisa",
+        "zuruck",
+        "zurück",
+        "back",
+        "voltar",
+        "remove",
+        "entfernen",
+        "microphone",
+        "voice",
+        "camera",
+        "foto",
+        "photo",
+    )
+    WHATSAPP_HREF_HINTS = (
+        "wa.me",
+        "api.whatsapp.com",
+        "web.whatsapp.com",
+        "app.whatsapp",
+        "whatsapp://",
+        "whatsapp.com",
+    )
+    WHATSAPP_TEXT_HINTS = (
+        "whatsapp",
+        "whats app",
+        "wa.me",
+        "wpp",
+        "wapp",
+    )
 
     def __init__(
         self,
@@ -572,6 +614,7 @@ class SearchController:
                 if self._hooks_enabled and category in ("Ad", "Shopping"):
                     hooks.after_ad_click_hook(self._driver)
 
+                self._maybe_click_whatsapp_interaction(category)
                 self._start_random_action_threads()
 
                 url = (
@@ -601,6 +644,154 @@ class SearchController:
         # go back to the original window
         self._driver.switch_to.window(original_window_handle)
         sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+    def _maybe_click_whatsapp_interaction(self, category: str) -> None:
+        """Optionally click a visible WhatsApp-style CTA on the landing page."""
+
+        candidates = self._find_whatsapp_candidates()
+        if not candidates:
+            logger.debug("No WhatsApp interaction candidates found on landing page.")
+            return
+
+        top_score = candidates[0]["score"]
+        top_candidates = [candidate for candidate in candidates if candidate["score"] == top_score]
+        candidate = random.choice(top_candidates)
+
+        current_handle = self._driver.current_window_handle
+        before_handles = list(self._driver.window_handles)
+        before_url = self._driver.current_url
+        element = candidate["element"]
+
+        logger.info(
+            "Trying WhatsApp interaction on landing page: "
+            f"tag={candidate['tag']}, text={candidate['text']!r}, href={candidate['href']!r}"
+        )
+        self._save_step_screenshot(f"{category.lower().replace('-', '_')}_whatsapp_before_click")
+
+        try:
+            self._driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                element,
+            )
+            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
+            try:
+                element.click()
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+                WebDriverException,
+            ):
+                self._driver.execute_script("arguments[0].click();", element)
+        except Exception as exp:
+            logger.debug(f"WhatsApp interaction click attempt failed: {exp}")
+            return
+
+        sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+
+        new_handles = [handle for handle in self._driver.window_handles if handle not in before_handles]
+        if new_handles:
+            logger.info(f"WhatsApp interaction opened {len(new_handles)} extra tab(s).")
+            for index, handle in enumerate(new_handles, start=1):
+                try:
+                    self._driver.switch_to.window(handle)
+                    logger.info(f"WhatsApp interaction tab {index} URL: {self._driver.current_url}")
+                    self._save_step_screenshot(
+                        f"{category.lower().replace('-', '_')}_whatsapp_tab_{index:02d}"
+                    )
+                    sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+                    self._driver.close()
+                except Exception as exp:
+                    logger.debug(f"Failed to inspect/close WhatsApp interaction tab: {exp}")
+            self._driver.switch_to.window(current_handle)
+            self._wait_for_page_settle(timeout=4)
+            return
+
+        after_url = self._driver.current_url
+        if after_url != before_url:
+            logger.info(f"WhatsApp interaction changed current tab URL to: {after_url}")
+            self._save_step_screenshot(f"{category.lower().replace('-', '_')}_whatsapp_same_tab")
+            sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+            try:
+                self._driver.back()
+                self._wait_for_page_settle(timeout=4)
+            except Exception as exp:
+                logger.debug(f"Failed to navigate back after WhatsApp interaction: {exp}")
+            return
+
+        logger.debug("WhatsApp interaction stayed on the same page without URL change.")
+
+    def _find_whatsapp_candidates(self) -> list[dict[str, object]]:
+        """Find visible, clickable WhatsApp-style CTA elements on the current page."""
+
+        try:
+            elements = self._driver.find_elements(By.CSS_SELECTOR, "a, button, [role='button']")
+        except Exception as exp:
+            logger.debug(f"Failed to enumerate WhatsApp interaction candidates: {exp}")
+            return []
+
+        candidates: list[dict[str, object]] = []
+        seen_signatures: set[tuple[str, str, str]] = set()
+
+        for element in elements:
+            try:
+                if not element.is_displayed() or not element.is_enabled():
+                    continue
+
+                href = (element.get_attribute("href") or "").strip()
+                text = (element.text or "").strip()
+                aria_label = (element.get_attribute("aria-label") or "").strip()
+                title = (element.get_attribute("title") or "").strip()
+                name = (element.get_attribute("name") or "").strip()
+                element_id = (element.get_attribute("id") or "").strip()
+                class_name = (element.get_attribute("class") or "").strip()
+                tag_name = (element.tag_name or "").strip().lower()
+
+                href_lower = href.lower()
+                text_lower = " ".join(part for part in (text, aria_label, title, name) if part).lower()
+                attr_lower = " ".join(part for part in (element_id, class_name) if part).lower()
+
+                if any(token in text_lower for token in self.UNRELATED_UI_BUTTON_PHRASES):
+                    continue
+
+                score = 0
+                if any(token in href_lower for token in self.WHATSAPP_HREF_HINTS):
+                    score += 100
+                if any(token in text_lower for token in self.WHATSAPP_TEXT_HINTS):
+                    score += 50
+                if any(token in attr_lower for token in self.WHATSAPP_TEXT_HINTS):
+                    score += 20
+                if tag_name == "a":
+                    score += 10
+                if href_lower.startswith(("https://", "http://", "whatsapp://")):
+                    score += 5
+
+                if score <= 0:
+                    continue
+
+                signature = (tag_name, href_lower, text_lower)
+                if signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+
+                candidates.append(
+                    {
+                        "score": score,
+                        "element": element,
+                        "tag": tag_name,
+                        "href": href,
+                        "text": text or aria_label or title or name or element_id or class_name,
+                    }
+                )
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+                WebDriverException,
+            ):
+                continue
+
+        candidates.sort(key=lambda candidate: int(candidate["score"]), reverse=True)
+        return candidates
 
     def _open_link_in_new_tab(
         self, link_element: selenium.webdriver.remote.webelement.WebElement

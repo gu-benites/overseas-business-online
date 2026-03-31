@@ -1,7 +1,2 @@
 # One domain per line.
 # Ads whose target domain matches one of these entries will never be clicked.
-desentupidorarsw.com.br
-desentupidorasousa.com.br
-desentupidorafgs.com.br
-zebostinha.com.br
-kombosta.com.br
