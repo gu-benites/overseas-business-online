@@ -2,6 +2,7 @@ import sys
 import json
 import random
 import urllib.parse
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 import re
@@ -52,6 +53,10 @@ NonAdList = list[LinkElement]
 AllLinks = list[Union[AdList, NonAdList]]
 
 
+class BrowserSessionUnavailableError(RuntimeError):
+    """Raised when the local Chrome/WebDriver session disappears mid-run."""
+
+
 class SearchController:
     """Search controller for ad clicker
 
@@ -76,9 +81,15 @@ class SearchController:
     CAPTCHA_DIALOG = (By.CSS_SELECTOR, "div[aria-label^='Captcha-Dialog']")
     CAPTCHA_IFRAME = (By.CSS_SELECTOR, "iframe[title='Captcha']")
     RECAPTCHA = (By.ID, "recaptcha")
+    CAPTCHA_SITEKEY = (By.CSS_SELECTOR, "#recaptcha, [data-sitekey]")
     BLOCK_PAGE_MARKERS = (
         "Our systems have detected unusual traffic",
         "Please try your request again later.",
+    )
+    CAPTCHA_URL_MARKERS = (
+        "/sorry/",
+        "/sorry/index",
+        "recaptcha",
     )
     RESULTS_READY_SELECTORS = (
         (By.ID, "appbar"),
@@ -93,6 +104,93 @@ class SearchController:
     )
     LOC_CONTINUE_BUTTON = (By.TAG_NAME, "g-raised-button")
     NOT_NOW_BUTTON = (By.CSS_SELECTOR, "g-raised-button[data-ved]")
+    BUTTON_CANDIDATE_SELECTORS = (
+        (By.TAG_NAME, "button"),
+        (By.TAG_NAME, "g-raised-button"),
+        (By.CSS_SELECTOR, "[role='button']"),
+        (By.CSS_SELECTOR, "input[type='button']"),
+        (By.CSS_SELECTOR, "input[type='submit']"),
+    )
+    COOKIE_CONSENT_ACTION_PHRASES = (
+        "accept all",
+        "accept",
+        "agree",
+        "i agree",
+        "got it",
+        "alle akzeptieren",
+        "akzeptieren",
+        "ich stimme zu",
+        "alle ablehnen",
+        "ablehnen",
+        "aceitar tudo",
+        "aceitar",
+        "concordo",
+        "rejeitar tudo",
+        "rejeitar",
+        "aceptar todo",
+        "aceptar",
+        "rechazar todo",
+        "rechazar",
+        "reject all",
+        "reject",
+        "decline all",
+        "decline",
+    )
+    LOCATION_DISMISS_ACTION_PHRASES = (
+        "not now",
+        "agora nao",
+        "agora não",
+        "jetzt nicht",
+        "ahora no",
+    )
+    LOCATION_CONTINUE_ACTION_PHRASES = (
+        "continue",
+        "continuar",
+        "weiter",
+        "prosseguir",
+    )
+    UNRELATED_UI_BUTTON_PHRASES = (
+        "upload",
+        "image",
+        "bild",
+        "imagem",
+        "file",
+        "datei",
+        "arquivo",
+        "language",
+        "sprache",
+        "idioma",
+        "search",
+        "google suche",
+        "google search",
+        "pesquisa",
+        "zuruck",
+        "zurück",
+        "back",
+        "voltar",
+        "remove",
+        "entfernen",
+        "microphone",
+        "voice",
+        "camera",
+        "foto",
+        "photo",
+    )
+    WHATSAPP_HREF_HINTS = (
+        "wa.me",
+        "api.whatsapp.com",
+        "web.whatsapp.com",
+        "app.whatsapp",
+        "whatsapp://",
+        "whatsapp.com",
+    )
+    WHATSAPP_TEXT_HINTS = (
+        "whatsapp",
+        "whats app",
+        "wa.me",
+        "wpp",
+        "wapp",
+    )
 
     def __init__(
         self,
@@ -210,43 +308,17 @@ class SearchController:
         self._wait_for_page_settle()
         self._ensure_browser_session_alive("after_second_settle")
         self._record_proxy_ip_checkpoint("session_start")
-        self._check_captcha()
         self._abort_if_google_blocked("search_start")
 
         logger.info(f"Starting search for '{self._search_query}'")
         sleep(get_random_sleep(1, 2) * config.behavior.wait_factor)
 
-        try:
-            search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-            self._type_humanlike(search_input_box, self._search_query)
-
-        except ElementNotInteractableException:
-            self._check_captcha()
-            self._close_cookie_dialog()
-
-            try:
-                logger.debug("Waiting for search box to be ready...")
-
-                wait = WebDriverWait(self._driver, timeout=7)
-                searchbox_ready = wait.until(EC.element_to_be_clickable(self.SEARCH_INPUT))
-
-                if searchbox_ready:
-                    logger.debug("Search box is ready...")
-
-                    try:
-                        search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                        self._type_humanlike(search_input_box, self._search_query)
-                    except ElementNotInteractableException:
-                        pass
-
-            except TimeoutException:
-                logger.error("Timed out waiting for search box! Falling back to direct search URL.")
-                self._open_search_results_directly()
-        except NoSuchElementException:
+        if not self._submit_search_query():
             self._abort_if_google_blocked("search_input_missing")
-            logger.warning("Search input was not found. Falling back to direct search URL.")
+            logger.warning("Search input was not ready. Falling back to direct search URL.")
             self._open_search_results_directly()
 
+        self._wait_for_page_settle(timeout=6)
         self._check_captcha()
         self._abort_if_google_blocked("after_query_submit")
 
@@ -255,15 +327,16 @@ class SearchController:
 
         if not self._results_page_ready():
             self._close_cookie_dialog()
-
-            try:
-                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                if not search_input_box.get_attribute("value"):
-                    logger.debug(f"Reentering search query '{self._search_query}'")
-                    self._type_humanlike(search_input_box, self._search_query)
-                    sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
-            except NoSuchElementException:
-                logger.debug("Search input is not available after direct search fallback.")
+            if not self._results_page_ready():
+                if not self._submit_search_query():
+                    logger.warning(
+                        "Results are still not ready after retrying the homepage search box. "
+                        "Falling back to direct search URL."
+                    )
+                    self._open_search_results_directly()
+                self._check_captcha()
+                self._abort_if_google_blocked("after_retry_submit")
+                sleep(get_random_sleep(2, 3) * config.behavior.wait_factor)
 
         if self._hooks_enabled:
             hooks.after_query_sent_hook(self._driver, self._search_query)
@@ -572,6 +645,7 @@ class SearchController:
                 if self._hooks_enabled and category in ("Ad", "Shopping"):
                     hooks.after_ad_click_hook(self._driver)
 
+                self._maybe_click_whatsapp_interaction(category)
                 self._start_random_action_threads()
 
                 url = (
@@ -601,6 +675,157 @@ class SearchController:
         # go back to the original window
         self._driver.switch_to.window(original_window_handle)
         sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+    def _maybe_click_whatsapp_interaction(self, category: str) -> None:
+        """Optionally click a visible WhatsApp-style CTA on the landing page."""
+
+        candidates = self._find_whatsapp_candidates()
+        if not candidates:
+            logger.debug("No WhatsApp interaction candidates found on landing page.")
+            return
+
+        top_score = candidates[0]["score"]
+        top_candidates = [candidate for candidate in candidates if candidate["score"] == top_score]
+        candidate = random.choice(top_candidates)
+
+        current_handle = self._driver.current_window_handle
+        before_handles = list(self._driver.window_handles)
+        before_url = self._driver.current_url
+        element = candidate["element"]
+
+        logger.info(
+            "Trying WhatsApp interaction on landing page: "
+            f"tag={candidate['tag']}, text={candidate['text']!r}, href={candidate['href']!r}"
+        )
+        self._save_step_screenshot(f"{category.lower().replace('-', '_')}_whatsapp_before_click")
+
+        try:
+            self._driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                element,
+            )
+            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
+            try:
+                element.click()
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+                WebDriverException,
+            ):
+                self._driver.execute_script("arguments[0].click();", element)
+        except Exception as exp:
+            logger.debug(f"WhatsApp interaction click attempt failed: {exp}")
+            return
+
+        sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+
+        new_handles = [handle for handle in self._driver.window_handles if handle not in before_handles]
+        if new_handles:
+            logger.info(f"WhatsApp interaction opened {len(new_handles)} extra tab(s).")
+            for index, handle in enumerate(new_handles, start=1):
+                try:
+                    self._driver.switch_to.window(handle)
+                    logger.info(
+                        f"WhatsApp interaction tab {index} URL: {self._driver.current_url}"
+                    )
+                    self._save_step_screenshot(
+                        f"{category.lower().replace('-', '_')}_whatsapp_tab_{index:02d}"
+                    )
+                    sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+                    self._driver.close()
+                except Exception as exp:
+                    logger.debug(f"Failed to inspect/close WhatsApp interaction tab: {exp}")
+            self._driver.switch_to.window(current_handle)
+            self._wait_for_page_settle(timeout=4)
+            return
+
+        after_url = self._driver.current_url
+        if after_url != before_url:
+            logger.info(f"WhatsApp interaction changed current tab URL to: {after_url}")
+            self._save_step_screenshot(f"{category.lower().replace('-', '_')}_whatsapp_same_tab")
+            sleep(get_random_sleep(1.5, 2.5) * config.behavior.wait_factor)
+            try:
+                self._driver.back()
+                self._wait_for_page_settle(timeout=4)
+            except Exception as exp:
+                logger.debug(f"Failed to navigate back after WhatsApp interaction: {exp}")
+            return
+
+        logger.debug("WhatsApp interaction stayed on the same page without URL change.")
+
+    def _find_whatsapp_candidates(self) -> list[dict[str, object]]:
+        """Find visible, clickable WhatsApp-style CTA elements on the current page."""
+
+        try:
+            elements = self._driver.find_elements(By.CSS_SELECTOR, "a, button, [role='button']")
+        except Exception as exp:
+            logger.debug(f"Failed to enumerate WhatsApp interaction candidates: {exp}")
+            return []
+
+        candidates: list[dict[str, object]] = []
+        seen_signatures: set[tuple[str, str, str]] = set()
+
+        for element in elements:
+            try:
+                if not element.is_displayed() or not element.is_enabled():
+                    continue
+
+                href = (element.get_attribute("href") or "").strip()
+                text = (element.text or "").strip()
+                aria_label = (element.get_attribute("aria-label") or "").strip()
+                title = (element.get_attribute("title") or "").strip()
+                name = (element.get_attribute("name") or "").strip()
+                element_id = (element.get_attribute("id") or "").strip()
+                class_name = (element.get_attribute("class") or "").strip()
+                tag_name = (element.tag_name or "").strip().lower()
+
+                href_lower = href.lower()
+                text_lower = " ".join(
+                    part
+                    for part in (text, aria_label, title, name)
+                    if part
+                ).lower()
+                attr_lower = " ".join(part for part in (element_id, class_name) if part).lower()
+
+                score = 0
+                if any(token in href_lower for token in self.WHATSAPP_HREF_HINTS):
+                    score += 100
+                if any(token in text_lower for token in self.WHATSAPP_TEXT_HINTS):
+                    score += 50
+                if any(token in attr_lower for token in self.WHATSAPP_TEXT_HINTS):
+                    score += 20
+                if tag_name == "a":
+                    score += 10
+                if href_lower.startswith(("https://", "http://", "whatsapp://")):
+                    score += 5
+
+                if score <= 0:
+                    continue
+
+                signature = (tag_name, href_lower, text_lower)
+                if signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+
+                candidates.append(
+                    {
+                        "score": score,
+                        "element": element,
+                        "tag": tag_name,
+                        "href": href,
+                        "text": text or aria_label or title or name or element_id or class_name,
+                    }
+                )
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+                WebDriverException,
+            ):
+                continue
+
+        candidates.sort(key=lambda candidate: int(candidate["score"]), reverse=True)
+        return candidates
 
     def _open_link_in_new_tab(
         self, link_element: selenium.webdriver.remote.webelement.WebElement
@@ -742,10 +967,8 @@ class SearchController:
             logger.info("Checking shopping ads...")
 
             # for mobile user-agents
-            if self._driver.find_elements(By.CLASS_NAME, "pla-unit-container"):
-                mobile_shopping_ads = self._driver.find_elements(
-                    By.CLASS_NAME, "pla-unit-container"
-                )
+            mobile_shopping_ads = self._driver.find_elements(By.CLASS_NAME, "pla-unit-container")
+            if mobile_shopping_ads:
                 for shopping_ad in mobile_shopping_ads[:5]:
                     ad = shopping_ad.find_element(By.TAG_NAME, "a")
                     shopping_ad_link = ad.get_attribute("href")
@@ -763,7 +986,15 @@ class SearchController:
                     ads.append(ad_fields)
 
             else:
-                commercial_unit_container = self._driver.find_element(By.CLASS_NAME, "cu-container")
+                commercial_unit_containers = self._driver.find_elements(
+                    By.CLASS_NAME,
+                    "cu-container",
+                )
+                if not commercial_unit_containers:
+                    logger.info("No shopping ads are shown!")
+                    return []
+
+                commercial_unit_container = commercial_unit_containers[0]
                 shopping_ads = commercial_unit_container.find_elements(By.CLASS_NAME, "pla-unit")
 
                 for shopping_ad in shopping_ads[:5]:
@@ -834,6 +1065,10 @@ class SearchController:
 
         except NoSuchElementException:
             logger.info("No shopping ads are shown!")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("shopping_ad_scan", exp)
+            raise
 
         return ads
 
@@ -845,113 +1080,129 @@ class SearchController:
         """
 
         logger.info("Getting ad links...")
+        try:
+            ads = []
 
-        ads = []
+            scroll_count = 0
 
-        scroll_count = 0
+            logger.debug(f"Max scroll limit: {self._max_scroll_limit}")
 
-        logger.debug(f"Max scroll limit: {self._max_scroll_limit}")
+            while not self._is_scroll_at_the_end():
+                try:
+                    top_ads_containers = self._driver.find_elements(*self.TOP_ADS_CONTAINER)
+                    for ad_container in top_ads_containers:
+                        ads.extend(ad_container.find_elements(*self.AD_RESULTS))
 
-        while not self._is_scroll_at_the_end():
-            try:
-                top_ads_containers = self._driver.find_elements(*self.TOP_ADS_CONTAINER)
-                for ad_container in top_ads_containers:
-                    ads.extend(ad_container.find_elements(*self.AD_RESULTS))
+                except NoSuchElementException:
+                    logger.debug("Could not found top ads!")
 
-            except NoSuchElementException:
-                logger.debug("Could not found top ads!")
+                try:
+                    bottom_ads_containers = self._driver.find_elements(*self.BOTTOM_ADS_CONTAINER)
+                    for ad_container in bottom_ads_containers:
+                        ads.extend(ad_container.find_elements(*self.AD_RESULTS))
 
-            try:
-                bottom_ads_containers = self._driver.find_elements(*self.BOTTOM_ADS_CONTAINER)
-                for ad_container in bottom_ads_containers:
-                    ads.extend(ad_container.find_elements(*self.AD_RESULTS))
+                except NoSuchElementException:
+                    logger.debug("Could not found bottom ads!")
 
-            except NoSuchElementException:
-                logger.debug("Could not found bottom ads!")
-
-            if self._max_scroll_limit > 0:
-                if scroll_count == self._max_scroll_limit:
-                    logger.debug("Reached to max scroll limit! Ending scroll...")
-                    break
-
-            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
-            sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
-
-            scroll_count += 1
-
-        if not ads:
-            return []
-
-        # clean non-ad links and duplicates
-        cleaned_ads = []
-        links = []
-
-        for ad in ads:
-            if ad.get_attribute("data-pcu"):
-                ad_link = ad.get_attribute("href")
-
-                if ad_link not in links:
-                    links.append(ad_link)
-                    cleaned_ads.append(ad)
-
-        self._stats.ads_found = len(cleaned_ads)
-
-        # if there are filter words given, filter results accordingly
-        filtered_ads = []
-
-        if self._filter_words:
-            for ad in cleaned_ads:
-                ad_title = self._extract_ad_title(ad).lower()
-                ad_link = ad.get_attribute("data-pcu")
-
-                logger.debug(f"data-pcu ad_link: {ad_link}")
-
-                for word in self._filter_words:
-                    if word in ad_link or word in ad_title:
-                        if ad not in filtered_ads:
-                            logger.debug(f"Filtering [{ad_title}]: {ad_link}")
-                            self._stats.num_filtered_ads += 1
-                            filtered_ads.append(ad)
-        else:
-            filtered_ads = cleaned_ads
-
-        ad_links = []
-
-        for ad in filtered_ads:
-            ad_link = ad.get_attribute("href")
-            ad_target_link = ad.get_attribute("data-pcu") or ad_link
-            ad_title = self._extract_ad_title(ad)
-            logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
-
-            if self._ad_allowlist:
-                if not any(domain_matches_url(domain, ad_target_link) for domain in self._ad_allowlist):
-                    logger.debug(f"Skipping [{ad_title}] because it is not in ad_allowlist: {ad_target_link}")
-                    self._stats.num_filtered_ads += 1
-                    continue
-
-            if self._ad_denylist:
-                if any(domain_matches_url(domain, ad_target_link) for domain in self._ad_denylist):
-                    logger.debug(f"Skipping [{ad_title}] because it is in ad_denylist: {ad_target_link}")
-                    self._stats.num_excluded_ads += 1
-                    continue
-
-            if self._exclude_list:
-                for exclude_item in self._exclude_list:
-                    if (
-                        exclude_item in ad_target_link
-                        or exclude_item.lower() in ad_title.lower()
-                    ):
-                        logger.debug(f"Excluding [{ad_title}]: {ad_link}")
-                        self._stats.num_excluded_ads += 1
+                if self._max_scroll_limit > 0:
+                    if scroll_count == self._max_scroll_limit:
+                        logger.debug("Reached to max scroll limit! Ending scroll...")
                         break
+
+                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
+                sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+
+                scroll_count += 1
+
+            if not ads:
+                return []
+
+            # clean non-ad links and duplicates
+            cleaned_ads = []
+            links = []
+
+            for ad in ads:
+                if ad.get_attribute("data-pcu"):
+                    ad_link = ad.get_attribute("href")
+
+                    if ad_link not in links:
+                        links.append(ad_link)
+                        cleaned_ads.append(ad)
+
+            self._stats.ads_found = len(cleaned_ads)
+
+            # if there are filter words given, filter results accordingly
+            filtered_ads = []
+
+            if self._filter_words:
+                for ad in cleaned_ads:
+                    ad_title = self._extract_ad_title(ad).lower()
+                    ad_link = ad.get_attribute("data-pcu")
+
+                    logger.debug(f"data-pcu ad_link: {ad_link}")
+
+                    for word in self._filter_words:
+                        if word in ad_link or word in ad_title:
+                            if ad not in filtered_ads:
+                                logger.debug(f"Filtering [{ad_title}]: {ad_link}")
+                                self._stats.num_filtered_ads += 1
+                                filtered_ads.append(ad)
+            else:
+                filtered_ads = cleaned_ads
+
+            ad_links = []
+
+            for ad in filtered_ads:
+                ad_link = ad.get_attribute("href")
+                ad_target_link = ad.get_attribute("data-pcu") or ad_link
+                ad_title = self._extract_ad_title(ad)
+                logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
+
+                if self._ad_allowlist:
+                    if not any(
+                        domain_matches_url(domain, ad_target_link)
+                        for domain in self._ad_allowlist
+                    ):
+                        logger.debug(
+                            f"Skipping [{ad_title}] because it is not in ad_allowlist: "
+                            f"{ad_target_link}"
+                        )
+                        self._stats.num_filtered_ads += 1
+                        continue
+
+                if self._ad_denylist:
+                    if any(
+                        domain_matches_url(domain, ad_target_link)
+                        for domain in self._ad_denylist
+                    ):
+                        logger.debug(
+                            f"Skipping [{ad_title}] because it is in ad_denylist: "
+                            f"{ad_target_link}"
+                        )
+                        self._stats.num_excluded_ads += 1
+                        continue
+
+                if self._exclude_list:
+                    for exclude_item in self._exclude_list:
+                        if (
+                            exclude_item in ad_target_link
+                            or exclude_item.lower() in ad_title.lower()
+                        ):
+                            logger.debug(f"Excluding [{ad_title}]: {ad_link}")
+                            self._stats.num_excluded_ads += 1
+                            break
+                    else:
+                        logger.info("======= Found an Ad =======")
+                        ad_links.append((ad, ad_link, ad_title))
                 else:
                     logger.info("======= Found an Ad =======")
                     ad_links.append((ad, ad_link, ad_title))
-            else:
-                logger.info("======= Found an Ad =======")
-                ad_links.append((ad, ad_link, ad_title))
 
-        return ad_links
+            return ad_links
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("ad_scan", exp)
+            raise
 
     def _get_non_ad_links(
         self, ad_links: AdList, non_ad_domains: Optional[list[str]] = None
@@ -967,66 +1218,291 @@ class SearchController:
         """
 
         logger.info("Getting non-ad links...")
+        try:
+            # go to top of the page
+            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
 
-        # go to top of the page
-        self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
+            all_links = self._driver.find_elements(*self.ALL_LINKS)
 
-        all_links = self._driver.find_elements(*self.ALL_LINKS)
+            logger.debug(f"len(all_links): {len(all_links)}")
 
-        logger.debug(f"len(all_links): {len(all_links)}")
+            non_ad_links = []
 
-        non_ad_links = []
-
-        for link in all_links:
-            for ad in ad_links:
-                if link == ad[0]:
-                    # skip ad element
-                    break
-            else:
-                link_url = link.get_attribute("href")
-                if (
-                    link_url
-                    and (
-                        link.get_attribute("role")
-                        not in (
-                            "link",
-                            "button",
-                            "menuitem",
-                            "menuitemradio",
+            for link in all_links:
+                for ad in ad_links:
+                    if link == ad[0]:
+                        # skip ad element
+                        break
+                else:
+                    link_url = link.get_attribute("href")
+                    if (
+                        link_url
+                        and (
+                            link.get_attribute("role")
+                            not in (
+                                "link",
+                                "button",
+                                "menuitem",
+                                "menuitemradio",
+                            )
                         )
-                    )
-                    and link.get_attribute("jsname")
-                    and link.get_attribute("data-ved")
-                    and not link.get_attribute("data-rw")
-                    and "/maps" not in link_url
-                    and "/search?q" not in link_url
-                    and "googleadservices" not in link_url
-                    and "https://www.google" not in link_url
-                    and (link_url and link_url.startswith("http"))
-                    and len(link.find_elements(By.TAG_NAME, "svg")) == 0
-                ):
-                    if non_ad_domains:
-                        logger.debug(f"Evaluating [{link_url}] to add as non-ad link...")
+                        and link.get_attribute("jsname")
+                        and link.get_attribute("data-ved")
+                        and not link.get_attribute("data-rw")
+                        and "/maps" not in link_url
+                        and "/search?q" not in link_url
+                        and "googleadservices" not in link_url
+                        and "https://www.google" not in link_url
+                        and (link_url and link_url.startswith("http"))
+                        and len(link.find_elements(By.TAG_NAME, "svg")) == 0
+                    ):
+                        if non_ad_domains:
+                            logger.debug(f"Evaluating [{link_url}] to add as non-ad link...")
 
-                        for domain in non_ad_domains:
-                            if domain in link_url:
-                                logger.debug(f"Adding [{link_url}] to non-ad links")
-                                non_ad_links.append(link)
-                                break
-                    else:
-                        logger.debug(f"Adding [{link_url}] to non-ad links")
-                        non_ad_links.append(link)
+                            for domain in non_ad_domains:
+                                if domain in link_url:
+                                    logger.debug(f"Adding [{link_url}] to non-ad links")
+                                    non_ad_links.append(link)
+                                    break
+                        else:
+                            logger.debug(f"Adding [{link_url}] to non-ad links")
+                            non_ad_links.append(link)
 
-        logger.info(f"Found {len(non_ad_links)} non-ad links")
+            logger.info(f"Found {len(non_ad_links)} non-ad links")
 
-        # if there is no domain to filter, randomly select 3 links
-        if not non_ad_domains and len(non_ad_links) > 3:
-            logger.info("Randomly selecting 3 from non-ad links...")
-            non_ad_links = random.sample(non_ad_links, k=3)
+            # if there is no domain to filter, randomly select 3 links
+            if not non_ad_domains and len(non_ad_links) > 3:
+                logger.info("Randomly selecting 3 from non-ad links...")
+                non_ad_links = random.sample(non_ad_links, k=3)
 
-        return non_ad_links
+            return non_ad_links
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("non_ad_scan", exp)
+            raise
 
-    def _close_cookie_dialog(self) -> None:
+    @staticmethod
+    def _normalize_ui_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        without_accents = "".join(
+            character for character in normalized if not unicodedata.combining(character)
+        )
+        return " ".join(without_accents.lower().split())
+
+    @staticmethod
+    def _is_browser_session_unavailable_exception(exp: Exception) -> bool:
+        message = str(exp).lower()
+        return any(
+            marker in message
+            for marker in (
+                "invalid session id",
+                "tab crashed",
+                "disconnected",
+                "connection refused",
+                "connection aborted",
+                "remote end closed connection",
+                "failed to establish a new connection",
+            )
+        )
+
+    def _abort_due_to_browser_unavailable(self, stage: str, exp: Exception) -> None:
+        logger.error(
+            f"Browser session became unavailable during {stage}. "
+            "Stopping this run cleanly."
+        )
+        logger.debug(f"Browser-unavailable exception at {stage}: {exp}")
+        try:
+            self._save_step_screenshot(f"{stage}_browser_unavailable")
+        except Exception:
+            pass
+        try:
+            self._driver.quit()
+        except Exception:
+            pass
+        raise BrowserSessionUnavailableError(str(exp)) from exp
+
+    def _collect_element_ui_strings(
+        self, element: selenium.webdriver.remote.webelement.WebElement
+    ) -> list[str]:
+        values: list[str] = []
+        for attribute_name in ("aria-label", "title", "value", "id", "name", "class"):
+            try:
+                attribute_value = element.get_attribute(attribute_name)
+            except StaleElementReferenceException:
+                return []
+            if attribute_value:
+                values.append(attribute_value)
+
+        try:
+            text_value = element.text
+        except StaleElementReferenceException:
+            return values
+        if text_value:
+            values.append(text_value)
+
+        normalized_values: list[str] = []
+        for value in values:
+            normalized = self._normalize_ui_text(value)
+            if normalized and normalized not in normalized_values:
+                normalized_values.append(normalized)
+
+        return normalized_values
+
+    def _iter_visible_button_candidates(self):
+        seen_ids: set[str] = set()
+
+        for selector in self.BUTTON_CANDIDATE_SELECTORS:
+            try:
+                candidates = self._driver.find_elements(*selector)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("button_candidate_scan", exp)
+                raise
+
+            for candidate in candidates:
+                candidate_id = getattr(candidate, "id", None)
+                if candidate_id and candidate_id in seen_ids:
+                    continue
+                if candidate_id:
+                    seen_ids.add(candidate_id)
+
+                try:
+                    if not candidate.is_displayed() or not candidate.is_enabled():
+                        continue
+                except StaleElementReferenceException:
+                    continue
+                except Exception as exp:
+                    if self._is_browser_session_unavailable_exception(exp):
+                        self._abort_due_to_browser_unavailable(
+                            "button_candidate_visibility_check",
+                            exp,
+                        )
+                    raise
+
+                yield candidate
+
+    def _find_best_button_candidate(
+        self,
+        positive_phrases: tuple[str, ...],
+        *,
+        negative_phrases: tuple[str, ...] = (),
+    ) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        normalized_positive = tuple(self._normalize_ui_text(phrase) for phrase in positive_phrases)
+        normalized_negative = tuple(self._normalize_ui_text(phrase) for phrase in negative_phrases)
+        best_candidate = None
+        best_score = 0
+
+        for candidate in self._iter_visible_button_candidates():
+            ui_strings = self._collect_element_ui_strings(candidate)
+            if not ui_strings:
+                continue
+
+            combined_text = " | ".join(ui_strings)
+            if any(negative_phrase and negative_phrase in combined_text for negative_phrase in normalized_negative):
+                continue
+
+            score = 0
+            for positive_phrase in normalized_positive:
+                if not positive_phrase:
+                    continue
+                for ui_string in ui_strings:
+                    if ui_string == positive_phrase:
+                        score = max(score, 100 + len(positive_phrase))
+                    elif positive_phrase in ui_string:
+                        score = max(score, len(positive_phrase))
+
+            if score > best_score:
+                best_candidate = candidate
+                best_score = score
+
+        return best_candidate
+
+    def _click_ui_element(
+        self,
+        element: selenium.webdriver.remote.webelement.WebElement,
+        *,
+        stage: str,
+    ) -> None:
+        try:
+            self._driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                element,
+            )
+            sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable(stage, exp)
+
+        try:
+            element.click()
+        except ElementClickInterceptedException:
+            try:
+                self._driver.execute_script("arguments[0].click();", element)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable(stage, exp)
+                raise
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable(stage, exp)
+            raise
+
+    def _page_has_google_consent_surface(self) -> bool:
+        current_url = (self._driver.current_url or "").lower()
+        if "consent.google" in current_url or "consent.youtube" in current_url:
+            return True
+
+        try:
+            policy_links = self._driver.find_elements(By.CSS_SELECTOR, "a[href*='policies.google']")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("consent_surface_detection", exp)
+            raise
+
+        return bool(policy_links)
+
+    def _find_interactable_search_input(
+        self, timeout: int = 0
+    ) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        def _locate(_driver):
+            for element in self._driver.find_elements(*self.SEARCH_INPUT):
+                try:
+                    if element.is_displayed() and element.is_enabled():
+                        return element
+                except StaleElementReferenceException:
+                    continue
+            return False
+
+        if timeout <= 0:
+            located = _locate(None)
+            return located or None
+
+        try:
+            return WebDriverWait(self._driver, timeout).until(_locate)
+        except TimeoutException:
+            return None
+
+    def _submit_search_query(self) -> bool:
+        search_input_box = self._find_interactable_search_input(timeout=3)
+        if not search_input_box:
+            logger.debug("Search input is not visible and interactable.")
+            return False
+
+        try:
+            self._driver.execute_script("arguments[0].focus();", search_input_box)
+            search_input_box.click()
+            self._type_humanlike(search_input_box, self._search_query)
+            return True
+        except (ElementNotInteractableException, StaleElementReferenceException) as exp:
+            logger.debug(f"Search input could not be used for typing: {exp}")
+            return False
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("search_query_submission", exp)
+            logger.debug(f"Search query submission failed: {exp}")
+            return False
+
+    def _close_cookie_dialog(self) -> bool:
         """If cookie dialog is opened, close it by accepting"""
 
         logger.debug("Waiting for cookie dialog...")
@@ -1034,63 +1510,51 @@ class SearchController:
         sleep(get_random_sleep(3, 3.5) * config.behavior.wait_factor)
 
         try:
-            all_links = [
-                element.get_attribute("href")
-                for element in self._driver.find_elements(By.TAG_NAME, "a")
-                if isinstance(element.get_attribute("href"), str)
-            ]
-        except WebDriverException as exp:
-            exp_text = str(exp).lower()
-            if "invalid session id" in exp_text or "tab crashed" in exp_text or "disconnected" in exp_text:
-                logger.error(
-                    "Browser session became unavailable while checking cookie dialog. "
-                    "Stopping this run cleanly."
-                )
-                raise SystemExit()
+            consent_surface_present = self._page_has_google_consent_surface()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("cookie_dialog_detection", exp)
             raise
 
-        for link in all_links:
-            if "policies.google.com" in link:
-                buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)[6:-2]
-                if len(buttons) < 6:
-                    buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)
-
-                for button in buttons:
-                    try:
-                        if (
-                            button.get_attribute("role") != "link"
-                            and button.get_attribute("style") != "display:none"
-                        ):
-                            logger.debug(f"Clicking button {button.get_attribute('outerHTML')}")
-                            self._driver.execute_script(
-                                "arguments[0].scrollIntoView(true);", button
-                            )
-                            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
-                            button.click()
-                            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-
-                            try:
-                                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                                if not search_input_box.get_attribute("value"):
-                                    self._type_humanlike(search_input_box, self._search_query)
-                                    break
-                            except (
-                                ElementNotInteractableException,
-                                StaleElementReferenceException,
-                            ):
-                                pass
-
-                    except (
-                        ElementNotInteractableException,
-                        ElementClickInterceptedException,
-                        StaleElementReferenceException,
-                    ):
-                        pass
-
-                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-                break
-        else:
+        if not consent_surface_present:
             logger.debug("No cookie dialog found! Continue with search...")
+            return False
+
+        consent_handled = False
+
+        for attempt in range(3):
+            button = self._find_best_button_candidate(
+                self.COOKIE_CONSENT_ACTION_PHRASES,
+                negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+            )
+            if not button:
+                if not consent_handled:
+                    logger.debug("No recognizable cookie consent action button was found.")
+                break
+
+            try:
+                logger.debug(f"Clicking button {button.get_attribute('outerHTML')}")
+            except Exception:
+                logger.debug("Clicking cookie consent action button.")
+
+            try:
+                self._click_ui_element(button, stage=f"cookie_dialog_click_{attempt + 1}")
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+            ) as exp:
+                logger.debug(f"Cookie consent button interaction failed: {exp}")
+                continue
+
+            consent_handled = True
+            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+            self._wait_for_page_settle(timeout=4)
+
+            if not self._page_has_google_consent_surface():
+                break
+
+        return consent_handled
 
     def _is_scroll_at_the_end(self) -> bool:
         """Check if scroll is at the end
@@ -1128,10 +1592,17 @@ class SearchController:
             try:
                 if self._driver.find_elements(*selector):
                     return True
-            except Exception:
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("results_ready_probe", exp)
                 return False
 
-        current_url = (self._driver.current_url or "").lower()
+        try:
+            current_url = (self._driver.current_url or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("results_ready_url_probe", exp)
+            return False
         return "/search?" in current_url or "&q=" in current_url
 
     def _open_search_results_directly(self) -> None:
@@ -1147,22 +1618,65 @@ class SearchController:
         try:
             self._driver.execute_script("return document.readyState")
         except Exception as exp:
-            exp_text = str(exp).lower()
-            if "invalid session id" in exp_text or "tab crashed" in exp_text or "disconnected" in exp_text:
-                logger.error(
-                    f"Browser session became unavailable during {stage}. "
-                    "Stopping this run cleanly."
-                )
-                try:
-                    self._save_step_screenshot(f"{stage}_browser_unavailable")
-                except Exception:
-                    pass
-                try:
-                    self._driver.quit()
-                except Exception:
-                    pass
-                raise SystemExit()
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable(stage, exp)
             raise
+
+    def _page_has_captcha_indicators(self) -> bool:
+        try:
+            current_url = (self._driver.current_url or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("captcha_url_probe", exp)
+            raise
+
+        if any(marker in current_url for marker in self.CAPTCHA_URL_MARKERS):
+            return True
+
+        try:
+            page_text = (self._driver.page_source or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("captcha_page_source_probe", exp)
+            raise
+
+        return any(
+            marker in page_text
+            for marker in (
+                "g-recaptcha",
+                "data-sitekey",
+                "captcha-dialog",
+                *[marker.lower() for marker in self.BLOCK_PAGE_MARKERS],
+            )
+        )
+
+    def _find_captcha_container(self) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        for selector in (self.CAPTCHA_SITEKEY, self.RECAPTCHA):
+            try:
+                elements = self._driver.find_elements(*selector)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("captcha_element_probe", exp)
+                raise
+
+            for element in elements:
+                try:
+                    if element.is_displayed():
+                        return element
+                except StaleElementReferenceException:
+                    continue
+                except Exception as exp:
+                    if self._is_browser_session_unavailable_exception(exp):
+                        self._abort_due_to_browser_unavailable(
+                            "captcha_element_visibility_probe",
+                            exp,
+                        )
+                    raise
+
+            if elements:
+                return elements[0]
+
+        return None
 
     def _wait_for_page_settle(self, timeout: int = 8) -> None:
         """Give Google a chance to finish first paint/load before probing the page."""
@@ -1348,7 +1862,7 @@ class SearchController:
     def _check_captcha(self) -> None:
         """Check if captcha exists and solve it if 2captcha is used, otherwise exit"""
 
-        sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+        sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
         try:
             WebDriverWait(self._driver, timeout=5).until(
                 lambda driver: driver.execute_script("return document.readyState") in ("interactive", "complete")
@@ -1357,7 +1871,14 @@ class SearchController:
             logger.debug("Page readiness check timed out before captcha probe.")
 
         try:
-            captcha = self._driver.find_element(*self.RECAPTCHA)
+            if not self._page_has_captcha_indicators():
+                logger.debug("No captcha indicators seen. Continue to search...")
+                return
+
+            captcha = self._find_captcha_container()
+            if not captcha:
+                logger.debug("Captcha indicators were seen, but no captcha container was found.")
+                return
 
             if captcha:
                 logger.error("Captcha was shown.")
@@ -1383,7 +1904,13 @@ class SearchController:
                         self._save_step_screenshot(f"captcha_retry_refresh_{attempt_index:02d}")
                         self._driver.refresh()
                         sleep(get_random_sleep(3, 4) * config.behavior.wait_factor)
-                        captcha = self._driver.find_element(*self.RECAPTCHA)
+                        captcha = self._find_captcha_container()
+                        if not captcha:
+                            logger.warning(
+                                "Captcha container disappeared after refresh retry. "
+                                "Continuing with post-refresh page state."
+                            )
+                            return
 
                     cookies = ";".join(
                         [f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()]
@@ -1449,25 +1976,21 @@ class SearchController:
                     self._driver.quit()
                     raise SystemExit()
 
-        except NoSuchElementException:
-            logger.debug("No captcha seen. Continue to search...")
-        except WebDriverException as exp:
-            exp_text = str(exp).lower()
-            if "tab crashed" in exp_text or "invalid session id" in exp_text:
-                logger.error(
-                    "Browser became unstable while checking captcha presence. "
-                    "Stopping this run cleanly."
-                )
-                try:
-                    self._save_step_screenshot("captcha_check_browser_crashed")
-                except Exception:
-                    pass
-                self._driver.quit()
-                raise SystemExit()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("check_captcha", exp)
+            if isinstance(exp, NoSuchElementException):
+                logger.debug("No captcha seen. Continue to search...")
+                return
             raise
 
     def _is_google_block_page(self) -> bool:
-        page_text = (self._driver.page_source or "").lower()
+        try:
+            page_text = (self._driver.page_source or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("google_block_detection", exp)
+            raise
         return all(marker.lower() in page_text for marker in self.BLOCK_PAGE_MARKERS)
 
     def _abort_if_google_blocked(self, stage: str) -> None:
@@ -1493,11 +2016,11 @@ class SearchController:
             )
             return
 
-        try:
-            self._driver.find_element(*self.RECAPTCHA)
+        remaining_captcha = self._find_captcha_container()
+        if remaining_captcha:
             self._stats.captcha_accepted = False
             logger.warning("Captcha token was applied, but the captcha challenge is still present.")
-        except NoSuchElementException:
+        else:
             self._stats.captcha_accepted = True
             logger.info("Captcha challenge cleared and Google accepted the session.")
 
@@ -1633,45 +2156,65 @@ class SearchController:
         """Close 'Choose location for search results' popup"""
 
         try:
-            estimated_loc_img = self._driver.find_element(*self.ESTIMATED_LOC_IMG)
-            logger.debug(estimated_loc_img.get_attribute("outerHTML"))
+            estimated_loc_images = self._driver.find_elements(*self.ESTIMATED_LOC_IMG)
+            if estimated_loc_images:
+                estimated_loc_img = estimated_loc_images[0]
+                logger.debug(estimated_loc_img.get_attribute("outerHTML"))
+                logger.debug("Closing location choose dialog...")
+                self._click_ui_element(estimated_loc_img, stage="location_dialog_image")
 
-            logger.debug("Closing location choose dialog...")
-            estimated_loc_img.click()
+                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+                continue_button = self._find_best_button_candidate(
+                    self.LOCATION_CONTINUE_ACTION_PHRASES,
+                    negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+                )
+                if continue_button:
+                    logger.debug(continue_button.get_attribute("outerHTML"))
+                    self._click_ui_element(
+                        continue_button,
+                        stage="location_dialog_continue",
+                    )
+                    sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
+                    return
 
             sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
 
-            continue_button = self._driver.find_element(*self.LOC_CONTINUE_BUTTON)
-            logger.debug(continue_button.get_attribute("outerHTML"))
+            logger.debug("Checking alternative location dialog...")
+            logger.debug("Closing location choose dialog by selecting Not now...")
 
-            continue_button.click()
-
-            sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
-
-        except NoSuchElementException:
-
-            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-
-            try:
-                logger.debug("Checking alternative location dialog...")
-                logger.debug("Closing location choose dialog by selecting Not now...")
-
-                not_now_button = self._driver.find_element(*self.NOT_NOW_BUTTON)
-                logger.debug(not_now_button.get_attribute("outerHTML"))
-
-                not_now_button.click()
-
-                sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
-
-            except NoSuchElementException:
+            not_now_button = self._find_best_button_candidate(
+                self.LOCATION_DISMISS_ACTION_PHRASES,
+                negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+            )
+            if not not_now_button:
                 logger.debug("No location choose dialog seen. Continue to search...")
+                return
 
-            except ElementNotInteractableException:
-                logger.debug("Location dialog button element is not interactable!")
+            logger.debug(not_now_button.get_attribute("outerHTML"))
+            self._click_ui_element(not_now_button, stage="location_dialog_not_now")
+            sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
+
+        except ElementNotInteractableException:
+            logger.debug("Location dialog button element is not interactable!")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("close_choose_location_popup", exp)
+            raise
 
         finally:
             # if no not now or continue button exists, send ESC to page to close the dialog
-            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            try:
+                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            except NoSuchElementException:
+                pass
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable(
+                        "close_choose_location_popup_escape",
+                        exp,
+                    )
+                raise
 
     def _type_humanlike(
         self, element: selenium.webdriver.remote.webelement.WebElement, text: str
@@ -1686,7 +2229,16 @@ class SearchController:
 
         try:
             element.clear()
+        except Exception:
+            pass
 
+        try:
+            element.send_keys(Keys.CONTROL, "a")
+            element.send_keys(Keys.BACKSPACE)
+        except Exception:
+            pass
+
+        try:
             for character in text:
                 element.send_keys(character)
                 sleep(get_random_sleep(0.05, 0.15) * config.behavior.wait_factor)
@@ -1695,6 +2247,9 @@ class SearchController:
 
         except Exception as exp:
             logger.debug(f"Error while typing: {exp}")
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("type_search_query", exp)
+            raise
 
     def set_browser_id(self, browser_id: Optional[int] = None) -> None:
         """Set browser id in stats if multiple browsers are used

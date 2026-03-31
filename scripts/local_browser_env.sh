@@ -15,3 +15,7 @@ export PATH="$LOCAL_ROOT/usr/bin:$PATH"
 if [[ -z "${DISPLAY:-}" && -S /tmp/.X11-unix/X10 ]]; then
     export DISPLAY=:10
 fi
+
+if [[ "${DISPLAY:-}" == ":10" && -z "${XAUTHORITY:-}" && -f "$HOME/.Xauthority-xvfb-10" ]]; then
+    export XAUTHORITY="$HOME/.Xauthority-xvfb-10"
+fi

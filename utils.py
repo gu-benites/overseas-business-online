@@ -1,6 +1,7 @@
 import json
 import platform
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -43,10 +44,30 @@ class Direction(Enum):
     BOTH = "BOTH"
 
 
-def get_random_user_agent_string() -> str:
+def _normalize_user_agent_browser_version(user_agent_string: str) -> str:
+    browser_major_version = get_browser_major_version()
+    if not browser_major_version or not user_agent_string:
+        return user_agent_string
+
+    normalized_user_agent = re.sub(
+        r"\b(Chrome|CriOS)/\d+(?:\.\d+){0,3}",
+        lambda match: f"{match.group(1)}/{browser_major_version}.0.0.0",
+        user_agent_string,
+    )
+
+    if normalized_user_agent != user_agent_string:
+        logger.debug(
+            "Normalized user agent browser version to installed Chrome major: "
+            f"{normalized_user_agent}"
+        )
+
+    return normalized_user_agent
+
+
+def get_random_user_agent_string() -> Optional[str]:
     """Get random user agent
 
-    :rtype: str
+    :rtype: Optional[str]
     :returns: User agent string
     """
 
@@ -71,15 +92,19 @@ def get_random_user_agent_string() -> str:
         ]
 
     elif current_os == "Linux":
-        filtered_user_agents = [
-            ua for ua in all_user_agents if any(platform in ua for platform in ("Linux", "Android"))
-        ]
+        filtered_user_agents = [ua for ua in all_user_agents if "X11; Linux x86_64" in ua]
+
+        if not filtered_user_agents:
+            filtered_user_agents = [
+                ua for ua in all_user_agents if "Linux" in ua and "Android" not in ua
+            ]
 
     else:
         # fallback to all agents if no matching OS found
         filtered_user_agents = all_user_agents
 
     user_agent_string = random.choice(filtered_user_agents)
+    user_agent_string = _normalize_user_agent_browser_version(user_agent_string)
 
     logger.debug(f"user_agent: {user_agent_string}")
 
@@ -871,7 +896,7 @@ def _check_2captcha_v2_error(response_data: dict[str, Any], stage: str) -> tuple
     return (error_to_exit, error_to_continue)
 
 
-def get_locale_language(country_code: str) -> str:
+def get_locale_language(country_code: str | None) -> str:
     """Get locale language for the given country code
 
     :type country_code: str
@@ -880,14 +905,24 @@ def get_locale_language(country_code: str) -> str:
     :returns: Locale language for the given country code
     """
 
-    logger.debug(f"Getting locale language for {country_code}...")
+    normalized_country_code = str(country_code or "").strip().upper()
+    logger.debug(f"Getting locale language for {normalized_country_code or 'default'}...")
 
     with open("country_to_locale.json", "r") as locales_file:
         locales = json.load(locales_file)
 
-    locale_language = locales.get(country_code, ["en"])
+    locale_value = locales.get(normalized_country_code, ["en-US"])
+    if isinstance(locale_value, list):
+        locale_language = next(
+            (str(item).strip() for item in locale_value if str(item).strip()),
+            "en-US",
+        )
+    else:
+        locale_language = str(locale_value or "").strip() or "en-US"
 
-    logger.debug(f"Locale language code for {country_code}: {locale_language[0]}")
+    logger.debug(
+        f"Locale language code for {normalized_country_code or 'default'}: {locale_language}"
+    )
 
     return locale_language
 

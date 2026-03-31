@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
@@ -26,10 +27,14 @@ from utils import get_proxy_exit_ip
 
 STAT_PATTERN = re.compile(r"^\|\s*(?P<key>[^|]+?)\s*\|\s*(?P<value>[^|]+?)\s*\|$")
 JSON_SUMMARY_PREFIX = "JSON_SUMMARY:"
+PROJECT_ROOT = Path(__file__).resolve().parent
+USER_HOME = Path.home()
 UC_PROFILE_MARKER = str(UC_PROFILE_BASE_DIR) + "/"
-PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
-UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
-RUN_CLICK_LOG_DIR = "/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs"
+PROXY_PLUGIN_MARKER = str(PROJECT_ROOT / "proxy_auth_plugin") + "/"
+UC_DRIVER_MARKER = str(
+    USER_HOME / ".local" / "share" / "undetected_chromedriver" / "undetected_chromedriver"
+)
+RUN_CLICK_LOG_DIR = str(PROJECT_ROOT / ".streamlit_logs" / "grouped_click_runs")
 PROXY_PAYMENT_REQUIRED_MARKER = "402 Payment Required"
 PROXY_TUNNEL_FAILED_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
 PROXY_PAYMENT_REQUIRED_POLL_SECONDS = 60

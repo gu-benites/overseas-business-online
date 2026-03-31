@@ -1,0 +1,10 @@
+{
+  "pid": 151350,
+  "pgid": 151350,
+  "argv": [
+    "run_grouped_ad_clicker.py",
+    "--once",
+    "--group-city",
+    "Pedreira"
+  ]
+}

@@ -1,8 +1,10 @@
 import os
 import platform
 import random
+import re
 import string
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from time import sleep
@@ -40,7 +42,12 @@ else:
     PYAUTOGUI_IMPORT_ERROR = None
 
 from config_reader import config
-from browser_cleanup import UC_PROFILE_BASE_DIR, cleanup_stale_uc_profiles
+from browser_cleanup import (
+    UC_PROFILE_BASE_DIR,
+    cleanup_stale_uc_profiles,
+    release_runtime_dir,
+    reserve_unique_runtime_dir,
+)
 from geolocation_db import GeolocationDB
 from logger import logger
 from proxy import (
@@ -49,11 +56,130 @@ from proxy import (
     install_plugin,
     parse_proxy_value,
 )
-from utils import get_location, get_locale_language, get_random_sleep
+from utils import get_browser_major_version, get_location, get_locale_language, get_random_sleep
 
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
 PROJECT_ROOT = Path(__file__).resolve().parent
+COMMON_NOTEBOOK_WINDOW_SIZES = (
+    (1366, 768),
+    (1536, 864),
+    (1600, 900),
+    (1920, 1080),
+)
+COMMON_NOTEBOOK_WINDOW_WEIGHTS = (45, 25, 20, 10)
+
+
+def _bootstrap_linux_display() -> None:
+    """Attach to the persistent VPS Xvfb display when available."""
+
+    if not sys.platform.startswith("linux"):
+        return
+
+    x_socket = Path("/tmp/.X11-unix/X10")
+    if not os.environ.get("DISPLAY") and x_socket.exists():
+        os.environ["DISPLAY"] = ":10"
+
+    if os.environ.get("DISPLAY") == ":10" and not os.environ.get("XAUTHORITY"):
+        xauthority_path = Path.home() / ".Xauthority-xvfb-10"
+        if xauthority_path.exists():
+            os.environ["XAUTHORITY"] = str(xauthority_path)
+
+
+_bootstrap_linux_display()
+
+
+def _choose_rotating_window_size(
+    display_dimensions: Optional[tuple[int, int]] = None,
+) -> tuple[int, int]:
+    """Pick a realistic notebook-class window size, favoring lower resolutions."""
+
+    candidate_sizes = list(zip(COMMON_NOTEBOOK_WINDOW_SIZES, COMMON_NOTEBOOK_WINDOW_WEIGHTS))
+    if display_dimensions:
+        display_width, display_height = display_dimensions
+        fitting_sizes = [
+            (size, weight)
+            for size, weight in candidate_sizes
+            if size[0] <= display_width and size[1] <= display_height
+        ]
+        if fitting_sizes:
+            candidate_sizes = fitting_sizes
+        else:
+            width = max(1024, display_width)
+            height = max(600, display_height)
+            logger.debug(
+                "No rotating notebook size fits the active display. "
+                f"Using display dimensions {width}x{height}."
+            )
+            return width, height
+
+    sizes, weights = zip(*candidate_sizes)
+    width, height = random.choices(sizes, weights=weights, k=1)[0]
+    logger.debug(f"Selected rotating notebook window size: {width}x{height}")
+    return width, height
+
+
+def _build_accept_language_header(locale_code: Optional[str]) -> Optional[str]:
+    normalized_locale = str(locale_code or "").strip()
+    if not normalized_locale:
+        return None
+
+    primary_language = normalized_locale.split("-", 1)[0].strip()
+    ordered_values: list[str] = []
+    for candidate in (normalized_locale, primary_language, "en-US", "en"):
+        if candidate and candidate not in ordered_values:
+            ordered_values.append(candidate)
+
+    return ",".join(ordered_values)
+
+
+def _resolve_proxy_locale(country_code: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    locale_code = get_locale_language(country_code)
+    normalized_locale = str(locale_code or "").strip()
+    if not normalized_locale:
+        return None, None
+
+    accept_language = _build_accept_language_header(normalized_locale)
+    logger.debug(
+        "Resolved proxy locale settings: "
+        f"country_code={country_code}, locale={normalized_locale}, "
+        f"accept_language={accept_language}"
+    )
+    return normalized_locale, accept_language
+
+
+def _apply_browser_locale_overrides(
+    driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
+    *,
+    locale_code: Optional[str],
+    accept_language: Optional[str],
+    user_agent: Optional[str],
+) -> None:
+    if not locale_code and not accept_language:
+        return
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception as exp:
+        logger.debug(f"Failed to enable CDP Network domain for locale override: {exp}")
+
+    if accept_language:
+        try:
+            driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {"Accept-Language": accept_language}},
+            )
+        except Exception as exp:
+            logger.debug(f"Failed to set Accept-Language header override: {exp}")
+
+    try:
+        effective_user_agent = user_agent or driver.execute_script("return navigator.userAgent")
+        override_payload = {"userAgent": effective_user_agent}
+        if accept_language:
+            override_payload["acceptLanguage"] = accept_language
+        driver.execute_cdp_cmd("Emulation.setUserAgentOverride", override_payload)
+    except Exception as exp:
+        logger.debug(f"Failed to apply locale/user-agent override: {exp}")
 
 
 def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
@@ -244,6 +370,33 @@ def _has_usable_display(display_value: str | None) -> bool:
         return False
 
 
+def _get_display_dimensions(display_value: str | None) -> Optional[tuple[int, int]]:
+    if not _has_usable_display(display_value):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["xdpyinfo", "-display", display_value],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    match = re.search(r"dimensions:\s+(\d+)x(\d+)\s+pixels", result.stdout)
+    if not match:
+        return None
+
+    width = int(match.group(1))
+    height = int(match.group(2))
+    logger.debug(f"Detected active display dimensions: {width}x{height}")
+    return width, height
+
+
 class CustomChrome(undetected_chromedriver.Chrome):
     """Modified Chrome implementation"""
 
@@ -356,8 +509,21 @@ def create_webdriver(
     geolocation_db_client = GeolocationDB()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
     headless_fallback = sys.platform.startswith("linux") and not has_display
+    display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
+    rotating_window_size = (
+        None
+        if config.webdriver.window_size
+        else _choose_rotating_window_size(display_dimensions)
+    )
 
     chrome_options = undetected_chromedriver.ChromeOptions()
+    chrome_prefs = {
+        "webrtc.ip_handling_policy": "disable_non_proxied_udp",
+        "webrtc.multiple_routes_enabled": False,
+        "webrtc.nonproxied_udp_enabled": False,
+    }
+    locale_code = None
+    accept_language = None
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--no-first-run")
     chrome_options.add_argument("--no-service-autorun")
@@ -383,12 +549,13 @@ def create_webdriver(
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
     if headless_fallback:
+        fallback_width, fallback_height = rotating_window_size or (1366, 768)
         logger.warning(
             f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
             "Falling back to headless Chrome."
         )
         chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1366,768")
+        chrome_options.add_argument(f"--window-size={fallback_width},{fallback_height}")
     if user_agent:
         chrome_options.add_argument(f"--user-agent={user_agent}")
 
@@ -409,14 +576,6 @@ def create_webdriver(
     ]
     chrome_options.add_argument(f"--disable-features={','.join(disabled_features)}")
 
-    # disable WebRTC IP tracking
-    webrtc_preferences = {
-        "webrtc.ip_handling_policy": "disable_non_proxied_udp",
-        "webrtc.multiple_routes_enabled": False,
-        "webrtc.nonproxied_udp_enabled": False,
-    }
-    chrome_options.add_experimental_option("prefs", webrtc_preferences)
-
     if config.webdriver.incognito:
         chrome_options.add_argument("--incognito")
 
@@ -429,119 +588,163 @@ def create_webdriver(
             f"freed ~{freed_mb:.1f} MiB."
         )
 
-    base_dir = UC_PROFILE_BASE_DIR
-    base_dir.mkdir(exist_ok=True)
-    profile_dir = base_dir / f"profile_{random.randint(1000, 9999)}"
+    profile_dir = reserve_unique_runtime_dir(
+        UC_PROFILE_BASE_DIR,
+        prefix="profile_",
+        metadata={"kind": "uc_profile"},
+    )
+    profile_dir.mkdir(parents=True, exist_ok=True)
 
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
     chrome_options.add_argument("--profile-directory=Default")
 
     country_code = None
+    driver = None
 
-    multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
-    multi_procs_enabled = multi_browser_flag_file.exists()
-    driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
+    try:
+        multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
+        multi_procs_enabled = multi_browser_flag_file.exists()
+        driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
 
-    browser_binary_path = _get_browser_binary_path()
-    _ensure_local_uc_driver_cache()
-    if proxy:
-        if config.webdriver.auth:
-            username, password, host, port = _parse_proxy_components(proxy)
+        browser_binary_path = _get_browser_binary_path()
+        browser_major_version = get_browser_major_version()
+        if browser_major_version:
+            logger.debug(f"Detected browser major version: {browser_major_version}")
+        _ensure_local_uc_driver_cache()
+        if proxy:
+            if config.webdriver.auth:
+                username, password, host, port = _parse_proxy_components(proxy)
 
-            masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
-            masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
-            masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
-
-            logger.info(f"Using proxy: {masked_proxy}")
-            logger.debug(f"Using proxy: {proxy}")
-            session_id = _extract_proxy_session_id(proxy)
-            if session_id:
-                logger.info(f"Proxy sticky session id: {session_id}")
-
-            install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
-            sleep(2 * config.behavior.wait_factor)
-        else:
-            logger.info(f"Using proxy: {proxy}")
-            chrome_options.add_argument(f"--proxy-server={proxy}")
-
-        # get location of the proxy IP
-        lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
-        if not country_code and getattr(config.webdriver, "identity_mode", "legacy") == "native_linux":
-            inferred_country_code = _infer_country_code_from_proxy(proxy)
-            if inferred_country_code:
-                country_code = inferred_country_code
-                logger.info(
-                    "Identity mode 'native_linux' inferred country from proxy options: "
-                    f"{country_code}"
+                masked_username = (
+                    username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
                 )
-        if config.webdriver.language_from_proxy:
-            lang = get_locale_language(country_code)
-            chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
-            chrome_options.add_argument(f"--lang={lang[:2]}")
+                masked_password = (
+                    password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
+                )
+                masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
+
+                logger.info(f"Using proxy: {masked_proxy}")
+                logger.debug(f"Using proxy: {proxy}")
+                session_id = _extract_proxy_session_id(proxy)
+                if session_id:
+                    logger.info(f"Proxy sticky session id: {session_id}")
+
+                install_plugin(
+                    chrome_options,
+                    host,
+                    int(port),
+                    username,
+                    password,
+                    plugin_folder_name,
+                )
+                sleep(2 * config.behavior.wait_factor)
+            else:
+                logger.info(f"Using proxy: {proxy}")
+                chrome_options.add_argument(f"--proxy-server={proxy}")
+
+            # get location of the proxy IP
+            lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+            if (
+                not country_code
+                and getattr(config.webdriver, "identity_mode", "legacy") == "native_linux"
+            ):
+                inferred_country_code = _infer_country_code_from_proxy(proxy)
+                if inferred_country_code:
+                    country_code = inferred_country_code
+                    logger.info(
+                        "Identity mode 'native_linux' inferred country from proxy options: "
+                        f"{country_code}"
+                    )
+            if config.webdriver.language_from_proxy:
+                locale_code, accept_language = _resolve_proxy_locale(country_code)
+                if accept_language:
+                    chrome_prefs["intl.accept_languages"] = accept_language
+                if locale_code:
+                    chrome_options.add_argument(f"--lang={locale_code}")
+
+        chrome_options.add_experimental_option("prefs", chrome_prefs)
 
         driver = CustomChrome(
             browser_executable_path=browser_binary_path,
             driver_executable_path=driver_exe_path,
             options=chrome_options,
+            version_main=browser_major_version,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=True,
         )
+        driver._active_proxy = proxy if proxy else None
 
-        accuracy = 95
+        if proxy:
+            accuracy = 95
 
-        # set geolocation and timezone of the browser according to IP address
-        if lat and long:
-            driver.execute_cdp_cmd(
-                "Emulation.setGeolocationOverride",
-                {"latitude": lat, "longitude": long, "accuracy": accuracy},
+            # set geolocation and timezone of the browser according to IP address
+            if lat and long:
+                driver.execute_cdp_cmd(
+                    "Emulation.setGeolocationOverride",
+                    {"latitude": lat, "longitude": long, "accuracy": accuracy},
+                )
+
+                if not timezone:
+                    response = requests.get(
+                        f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}"
+                    )
+
+                    if response.status_code == 200:
+                        timezone = response.json()["tz_name"]
+
+                driver._custom_timezone = timezone
+
+                driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+
+                try:
+                    timezone_proxy_label = parse_proxy_value(proxy).host_port
+                except Exception:
+                    timezone_proxy_label = proxy
+                logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
+
+        if locale_code or accept_language:
+            _apply_browser_locale_overrides(
+                driver,
+                locale_code=locale_code,
+                accept_language=accept_language,
+                user_agent=user_agent,
             )
 
-            if not timezone:
-                response = requests.get(f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}")
+        driver._runtime_profile_dir = str(profile_dir)
 
-                if response.status_code == 200:
-                    timezone = response.json()["tz_name"]
+        if headless_fallback:
+            logger.debug("Skipping window maximize/position because Chrome is running headless.")
+        elif config.webdriver.window_size:
+            width, height = config.webdriver.window_size.split(",")
+            logger.debug(f"Setting window size as {width}x{height} px")
+            driver.set_window_size(width, height)
+        elif rotating_window_size:
+            width, height = rotating_window_size
+            logger.debug(f"Setting rotating window size as {width}x{height} px")
+            driver.set_window_size(width, height)
+        else:
+            logger.debug("Maximizing window...")
+            driver.maximize_window()
 
-            driver._custom_timezone = timezone
+        if config.webdriver.shift_windows and not headless_fallback:
+            width, height = (
+                config.webdriver.window_size.split(",")
+                if config.webdriver.window_size
+                else (None, None)
+            )
+            _shift_window_position(driver, width, height)
 
-            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
+        return (driver, country_code) if config.webdriver.country_domain else (driver, None)
+    except BaseException:
+        if driver:
             try:
-                timezone_proxy_label = parse_proxy_value(proxy).host_port
-            except Exception:
-                timezone_proxy_label = proxy
-            logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
-        driver._active_proxy = proxy
+                driver.quit()
+            except Exception as close_exp:
+                logger.debug(f"Failed to close browser after startup exception: {close_exp}")
 
-    else:
-        driver = CustomChrome(
-            browser_executable_path=browser_binary_path,
-            driver_executable_path=driver_exe_path,
-            options=chrome_options,
-            user_multi_procs=multi_procs_enabled,
-            use_subprocess=True,
-        )
-        driver._active_proxy = None
-
-    if headless_fallback:
-        logger.debug("Skipping window maximize/position because Chrome is running headless.")
-    elif config.webdriver.window_size:
-        width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
-        driver.set_window_size(width, height)
-    else:
-        logger.debug("Maximizing window...")
-        driver.maximize_window()
-
-    if config.webdriver.shift_windows and not headless_fallback:
-        width, height = (
-            config.webdriver.window_size.split(",")
-            if config.webdriver.window_size
-            else (None, None)
-        )
-        _shift_window_position(driver, width, height)
-
-    return (driver, country_code) if config.webdriver.country_domain else (driver, None)
+        if release_runtime_dir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
 
 
 def create_seleniumbase_driver(
@@ -563,8 +766,16 @@ def create_seleniumbase_driver(
     _ensure_seleniumbase_uses_system_chromedriver()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
     headless_fallback = sys.platform.startswith("linux") and not has_display
+    display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
+    rotating_window_size = (
+        None
+        if config.webdriver.window_size
+        else _choose_rotating_window_size(display_dimensions)
+    )
 
     country_code = None
+    locale_code = None
+    accept_language = None
 
     if proxy:
         if config.webdriver.auth:
@@ -586,7 +797,7 @@ def create_seleniumbase_driver(
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
 
         if config.webdriver.language_from_proxy:
-            lang = get_locale_language(country_code)
+            locale_code, accept_language = _resolve_proxy_locale(country_code)
 
     driver = seleniumbase.get_driver(
         browser_name="chrome",
@@ -597,11 +808,19 @@ def create_seleniumbase_driver(
         proxy_string=proxy or None,
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
-        locale_code=str(lang) if config.webdriver.language_from_proxy else None,
+        locale_code=locale_code if config.webdriver.language_from_proxy else None,
         binary_location=browser_binary_path,
         no_sandbox=True,
         disable_gpu=True,
     )
+
+    if locale_code or accept_language:
+        _apply_browser_locale_overrides(
+            driver,
+            locale_code=locale_code,
+            accept_language=accept_language,
+            user_agent=user_agent,
+        )
 
     # set geolocation and timezone if available
     if proxy and lat and long:
@@ -639,6 +858,10 @@ def create_seleniumbase_driver(
     elif config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
         logger.debug(f"Setting window size as {width}x{height} px")
+        driver.set_window_size(int(width), int(height))
+    elif rotating_window_size:
+        width, height = rotating_window_size
+        logger.debug(f"Setting rotating window size as {width}x{height} px")
         driver.set_window_size(int(width), int(height))
     else:
         logger.debug("Maximizing window...")

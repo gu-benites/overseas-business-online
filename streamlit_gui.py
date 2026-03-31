@@ -136,10 +136,16 @@ def start_process(script: str, extra_args: list[str] | None = None, process_key:
     if extra_args:
         args.extend(extra_args)
 
-    if os.name == "posix" and not os.environ.get("DISPLAY"):
-        # The VPS has XRDP running on Display :10 – prefer that for headful
-        # Chromium.  Fall back to xvfb-run only if absolutely necessary.
-        os.environ["DISPLAY"] = ":10"
+    if os.name == "posix":
+        x_socket = Path("/tmp/.X11-unix/X10")
+        xauthority_path = Path.home() / ".Xauthority-xvfb-10"
+        if not os.environ.get("DISPLAY") and x_socket.exists():
+            # The VPS has a persistent Xvfb display on :10. Prefer that for
+            # headful Chromium instead of forcing xvfb-run for every process.
+            os.environ["DISPLAY"] = ":10"
+        if os.environ.get("DISPLAY") == ":10" and not os.environ.get("XAUTHORITY"):
+            if xauthority_path.exists():
+                os.environ["XAUTHORITY"] = str(xauthority_path)
 
     log_path = LOG_DIR / f"{key}.log"
     try:

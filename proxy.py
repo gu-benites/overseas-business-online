@@ -1,3 +1,4 @@
+import shutil
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ except ImportError:
     from selenium.webdriver import ChromeOptions
 
 from config_reader import config
+from browser_cleanup import release_runtime_dir, reserve_runtime_dir
 from logger import logger
 
 
@@ -275,20 +277,28 @@ chrome.webRequest.onAuthRequired.addListener(
     )
 
     plugins_folder = Path.cwd() / "proxy_auth_plugin"
-    plugins_folder.mkdir(exist_ok=True)
+    plugins_folder.mkdir(parents=True, exist_ok=True)
 
-    plugin_folder = plugins_folder / plugin_folder_name
+    plugin_folder = reserve_runtime_dir(
+        plugins_folder / plugin_folder_name,
+        metadata={"kind": "proxy_auth_plugin"},
+    )
 
     logger.debug(f"Creating '{plugin_folder}' folder...")
-    plugin_folder.mkdir(exist_ok=True)
+    plugin_folder.mkdir(parents=True, exist_ok=True)
 
-    manifest_path = plugin_folder / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-        manifest_file.write(manifest_json)
+    try:
+        manifest_path = plugin_folder / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            manifest_file.write(manifest_json)
 
-    background_path = plugin_folder / "background.js"
-    with open(background_path, "w", encoding="utf-8") as background_js_file:
-        background_js_file.write(background_js)
+        background_path = plugin_folder / "background.js"
+        with open(background_path, "w", encoding="utf-8") as background_js_file:
+            background_js_file.write(background_js)
+    except Exception:
+        if release_runtime_dir(plugin_folder):
+            shutil.rmtree(plugin_folder, ignore_errors=True)
+        raise
 
     if not manifest_path.exists() or not background_path.exists():
         raise RuntimeError("Failed to create extension files")

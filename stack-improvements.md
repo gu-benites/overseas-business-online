@@ -52,6 +52,80 @@ Artefatos atuais:
 - [`/home/otavio/overseas-business-online/.run_screenshots`](/home/otavio/overseas-business-online/.run_screenshots)
 - [`/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs`](/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs)
 
+
+## Cron de produção atual
+
+Hoje o host tem `4` entradas reais no `crontab` do usuário `otavio`.
+
+### Janela de segunda a sexta
+
+Start às `06:00`:
+
+```cron
+0 6 * * 1-5 cd /home/otavio/overseas-business-online && /home/otavio/overseas-business-online/.venv/bin/python run_grouped_ad_clicker.py --max-concurrent-groups 2 --max-runtime-minutes 540 >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1
+```
+
+O que isso faz na prática:
+
+- sobe o grouped runner em modo contínuo
+- fixa concorrência em `2`
+- coloca um limite interno de `540` minutos, ou seja, `9h`
+- grava stdout/stderr em [`/home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log`](/home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log)
+
+Stop e cleanup às `15:15`:
+
+```cron
+15 15 * * 1-5 cd /home/otavio/overseas-business-online && /home/otavio/overseas-business-online/.venv/bin/python scripts/stop_grouped_runner.py >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1 && /home/otavio/overseas-business-online/.venv/bin/python /home/otavio/overseas-business-online/scripts/cleanup_old_artifacts.py --days 7 >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1
+```
+
+O que isso faz na prática:
+
+- tenta encerrar o process group salvo em [`/home/otavio/overseas-business-online/.runtime/run_grouped_ad_clicker_cli.json`](/home/otavio/overseas-business-online/.runtime/run_grouped_ad_clicker_cli.json)
+- só depois roda retenção de artefatos com janela de `7` dias
+- usa a mesma log file do start
+
+Leitura operacional:
+
+- a janela útil é `06:00` até algo próximo de `15:00`
+- o start usa `540` minutos e o stop roda `15` minutos depois
+- então o cron das `15:15` funciona mais como “guarda final + cleanup” do que como mecanismo primário de término
+
+### Janela de sábado
+
+Start às `06:00`:
+
+```cron
+0 6 * * 6 cd /home/otavio/overseas-business-online && /home/otavio/overseas-business-online/.venv/bin/python run_grouped_ad_clicker.py --max-concurrent-groups 2 --max-runtime-minutes 420 >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1
+```
+
+O que muda:
+
+- mesma lógica de segunda a sexta
+- runtime interno cai para `420` minutos, ou seja, `7h`
+
+Stop e cleanup às `13:15`:
+
+```cron
+15 13 * * 6 cd /home/otavio/overseas-business-online && /home/otavio/overseas-business-online/.venv/bin/python scripts/stop_grouped_runner.py >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1 && /home/otavio/overseas-business-online/.venv/bin/python /home/otavio/overseas-business-online/scripts/cleanup_old_artifacts.py --days 7 >> /home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_cron.log 2>&1
+```
+
+Leitura operacional:
+
+- a janela útil é `06:00` até algo próximo de `13:00`
+- o stop de `13:15` novamente funciona como margem operacional e cleanup
+
+### Conclusão prática sobre o cron atual
+
+O scheduler atual não está disparando jobs curtos e independentes.
+
+Na prática ele está fazendo `3` papéis diferentes:
+
+- abrir uma janela operacional do grouped runner
+- fechar essa janela com um stop tardio de segurança
+- rodar manutenção de retenção de artefatos
+
+Isso é exatamente o tipo de fluxo que fica mais legível e previsível em `systemd`.
+
 ## O que já foi comprovado na prática
 
 Algumas decisões abaixo são baseadas em incidentes reais já observados no host, não em especulação.
@@ -180,16 +254,120 @@ Problemas do cron nesse projeto:
 - kill de process group mais previsível
 - integração melhor com watchdog/monitoramento
 
-O que eu faria:
+Como eu migraria o cron atual:
 
-- criar um `grouped-runner.service`
-- criar um `grouped-runner.timer`
-- manter `scripts/stop_grouped_runner.py` como fallback operacional
+- criar um `grouped-runner.service` para o processo longo de [`run_grouped_ad_clicker.py`](/home/otavio/overseas-business-online/run_grouped_ad_clicker.py)
+- mover o start das `06:00` para timers separados por janela:
+  - `grouped-runner-weekday.timer`
+  - `grouped-runner-saturday.timer`
+- mover o stop das `15:15` e `13:15` para timers de parada explícita:
+  - `grouped-runner-stop-weekday.timer`
+  - `grouped-runner-stop-saturday.timer`
+- tirar a limpeza de artefatos da mesma linha do stop e colocar em um `artifacts-cleanup.service` com timer próprio
+- manter [`scripts/stop_grouped_runner.py`](/home/otavio/overseas-business-online/scripts/stop_grouped_runner.py) apenas como ferramenta manual de fallback
+
+### Desenho recomendado
+
+`grouped-runner.service`:
+
+- `Type=simple`
+- `WorkingDirectory=/home/otavio/overseas-business-online`
+- `ExecStart=/home/otavio/overseas-business-online/.venv/bin/python /home/otavio/overseas-business-online/run_grouped_ad_clicker.py --max-concurrent-groups 2`
+- `KillMode=control-group`
+- `TimeoutStopSec=30`
+- `Restart=on-failure`
+- `RuntimeMaxSec=` como fusível de segurança, não como agenda principal
+
+Ponto importante:
+
+- eu removeria `--max-runtime-minutes` do agendamento principal
+- o horário de funcionamento deveria ser responsabilidade dos timers de start/stop
+- o limite máximo de runtime ficaria no `systemd`, não escondido dentro do CLI
+
+`grouped-runner-weekday.timer`:
+
+- `OnCalendar=Mon..Fri 06:00`
+- dá `start` no serviço principal
+
+`grouped-runner-saturday.timer`:
+
+- `OnCalendar=Sat 06:00`
+- também dá `start` no serviço principal
+
+`grouped-runner-stop-weekday.timer`:
+
+- `OnCalendar=Mon..Fri 15:15`
+- aciona um oneshot simples que faz `systemctl stop grouped-runner.service`
+
+`grouped-runner-stop-saturday.timer`:
+
+- `OnCalendar=Sat 13:15`
+- mesma ideia para sábado
+
+`artifacts-cleanup.service`:
+
+- oneshot separado para [`scripts/cleanup_old_artifacts.py`](/home/otavio/overseas-business-online/scripts/cleanup_old_artifacts.py) com `--days 7`
+- logs no journald
+- sem depender de `&&` em linha de cron
+
+`artifacts-cleanup.timer`:
+
+- pode rodar logo após a janela operacional
+- exemplo prático:
+  - `Mon..Fri 15:20`
+  - `Sat 13:20`
+
+### Por que essa separação é a mais apropriada aqui
+
+`run_grouped_ad_clicker.py` já é um loop contínuo com lifecycle próprio:
+
+- registra estado em [`job_control.py`](/home/otavio/overseas-business-online/job_control.py)
+- faz cleanup de browsers órfãos
+- faz cleanup de perfis velhos
+- roda até receber stop ou até o timer interno expirar
+
+Ou seja:
+
+- ele se comporta como serviço
+- não como job curto de cron
+
+Também existe um detalhe importante:
+
+- hoje o stop agendado não é o mecanismo principal de encerramento
+- ele é uma margem de segurança porque o próprio runner já recebe `--max-runtime-minutes`
+
+Em `systemd`, o modelo fica mais limpo:
+
+- timers definem horário
+- service define lifecycle
+- cleanup define manutenção
+
+Isso evita acoplamento indevido entre:
+
+- encerramento do worker
+- retenção de arquivos
+- shell chaining com `&&`
+
+### Migração de cada entrada atual
+
+Mapeamento direto:
+
+- `0 6 * * 1-5 ... run_grouped_ad_clicker.py --max-runtime-minutes 540`
+  - vira `grouped-runner-weekday.timer`
+- `15 15 * * 1-5 ... stop_grouped_runner.py && cleanup_old_artifacts.py --days 7`
+  - vira `grouped-runner-stop-weekday.timer` + `artifacts-cleanup.timer`
+- `0 6 * * 6 ... run_grouped_ad_clicker.py --max-runtime-minutes 420`
+  - vira `grouped-runner-saturday.timer`
+- `15 13 * * 6 ... stop_grouped_runner.py && cleanup_old_artifacts.py --days 7`
+  - vira `grouped-runner-stop-saturday.timer` + `artifacts-cleanup.timer`
 
 Benefício esperado:
 
 - maior previsibilidade operacional
 - menos dependência de hacks de shell em cron
+- stop mais confiável via control group
+- logs melhores sem redirecionamento manual para arquivo
+- agenda operacional descrita em units legíveis, não espalhada em linhas de crontab
 
 ### 2. Criar uma tela de monitoramento no Streamlit
 
