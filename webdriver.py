@@ -53,6 +53,7 @@ from utils import get_location, get_locale_language, get_random_sleep
 
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
@@ -171,6 +172,78 @@ def _get_browser_binary_path() -> str:
     )
 
 
+def _ensure_local_uc_driver_cache() -> None:
+    """Keep the UC driver cache aligned with the system architecture on ARM hosts."""
+
+    if platform.machine() not in ("aarch64", "arm64", "armv8l"):
+        return
+
+    system_driver = Path("/usr/bin/chromedriver")
+    if not system_driver.exists():
+        return
+
+    local_driver = Path(_get_driver_exe_path()).expanduser()
+    local_driver.parent.mkdir(parents=True, exist_ok=True)
+
+    should_refresh = not local_driver.exists()
+    if not should_refresh:
+        try:
+            file_output = subprocess.check_output(
+                ["file", str(local_driver)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            should_refresh = "aarch64" not in file_output.lower()
+        except Exception:
+            should_refresh = True
+
+    if not should_refresh:
+        return
+
+    try:
+        shutil.copy2(system_driver, local_driver)
+        local_driver.chmod(0o755)
+        logger.info(f"Refreshed local UC driver cache from system chromedriver: {local_driver}")
+    except Exception as exp:
+        logger.warning(f"Failed to refresh local UC driver cache: {exp}")
+
+
+def _get_preferred_driver_executable_path(multi_procs_enabled: bool) -> str | None:
+    """Return a stable driver path, avoiding UC's broken x86 cache on ARM hosts."""
+
+    if platform.machine() in ("aarch64", "arm64", "armv8l"):
+        system_driver = Path("/usr/bin/chromedriver")
+        local_driver = PROJECT_ROOT / ".runtime" / "chromedriver-arm64"
+        if system_driver.exists():
+            try:
+                local_driver.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(system_driver, local_driver)
+                local_driver.chmod(0o755)
+                return str(local_driver)
+            except Exception as exp:
+                logger.warning(f"Failed to prepare ARM chromedriver copy: {exp}")
+    if multi_procs_enabled:
+        driver_exe_path = _get_driver_exe_path()
+        if Path(driver_exe_path).exists():
+            return driver_exe_path
+    return None
+
+
+def _has_usable_display(display_value: str | None) -> bool:
+    if not display_value or not sys.platform.startswith("linux"):
+        return False
+    try:
+        result = subprocess.run(
+            ["xdpyinfo", "-display", display_value],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 class CustomChrome(undetected_chromedriver.Chrome):
     """Modified Chrome implementation"""
 
@@ -281,6 +354,8 @@ def create_webdriver(
     proxy = _apply_sticky_session_to_proxy(proxy)
 
     geolocation_db_client = GeolocationDB()
+    has_display = _has_usable_display(os.environ.get("DISPLAY"))
+    headless_fallback = sys.platform.startswith("linux") and not has_display
 
     chrome_options = undetected_chromedriver.ChromeOptions()
     chrome_options.add_argument("--no-sandbox")
@@ -307,6 +382,13 @@ def create_webdriver(
     chrome_options.add_argument("--dns-prefetch-disable")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
+    if headless_fallback:
+        logger.warning(
+            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+            "Falling back to headless Chrome."
+        )
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--window-size=1366,768")
     if user_agent:
         chrome_options.add_argument(f"--user-agent={user_agent}")
 
@@ -358,12 +440,10 @@ def create_webdriver(
 
     multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
     multi_procs_enabled = multi_browser_flag_file.exists()
-    driver_exe_path = None
-
-    if multi_procs_enabled:
-        driver_exe_path = _get_driver_exe_path()
+    driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
 
     browser_binary_path = _get_browser_binary_path()
+    _ensure_local_uc_driver_cache()
     if proxy:
         if config.webdriver.auth:
             username, password, host, port = _parse_proxy_components(proxy)
@@ -401,9 +481,7 @@ def create_webdriver(
 
         driver = CustomChrome(
             browser_executable_path=browser_binary_path,
-            driver_executable_path=(
-                driver_exe_path if multi_procs_enabled and Path(driver_exe_path).exists() else None
-            ),
+            driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=True,
@@ -438,16 +516,16 @@ def create_webdriver(
     else:
         driver = CustomChrome(
             browser_executable_path=browser_binary_path,
-            driver_executable_path=(
-                driver_exe_path if multi_procs_enabled and Path(driver_exe_path).exists() else None
-            ),
+            driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=True,
         )
         driver._active_proxy = None
 
-    if config.webdriver.window_size:
+    if headless_fallback:
+        logger.debug("Skipping window maximize/position because Chrome is running headless.")
+    elif config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
         logger.debug(f"Setting window size as {width}x{height} px")
         driver.set_window_size(width, height)
@@ -455,7 +533,7 @@ def create_webdriver(
         logger.debug("Maximizing window...")
         driver.maximize_window()
 
-    if config.webdriver.shift_windows:
+    if config.webdriver.shift_windows and not headless_fallback:
         width, height = (
             config.webdriver.window_size.split(",")
             if config.webdriver.window_size
@@ -483,6 +561,8 @@ def create_seleniumbase_driver(
     proxy = _apply_sticky_session_to_proxy(proxy)
     browser_binary_path = _get_browser_binary_path()
     _ensure_seleniumbase_uses_system_chromedriver()
+    has_display = _has_usable_display(os.environ.get("DISPLAY"))
+    headless_fallback = sys.platform.startswith("linux") and not has_display
 
     country_code = None
 
@@ -511,7 +591,7 @@ def create_seleniumbase_driver(
     driver = seleniumbase.get_driver(
         browser_name="chrome",
         undetectable=False,
-        headless2=False,
+        headless2=headless_fallback,
         do_not_track=True,
         user_agent=user_agent,
         proxy_string=proxy or None,
@@ -550,7 +630,13 @@ def create_seleniumbase_driver(
     driver._active_proxy = proxy if proxy else None
 
     # handle window size and position
-    if config.webdriver.window_size:
+    if headless_fallback:
+        logger.warning(
+            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+            "Falling back to headless SeleniumBase Chrome."
+        )
+        logger.debug("Skipping window maximize/position because SeleniumBase Chrome is headless.")
+    elif config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
         logger.debug(f"Setting window size as {width}x{height} px")
         driver.set_window_size(int(width), int(height))
@@ -558,7 +644,7 @@ def create_seleniumbase_driver(
         logger.debug("Maximizing window...")
         driver.maximize_window()
 
-    if config.webdriver.shift_windows:
+    if config.webdriver.shift_windows and not headless_fallback:
         width, height = (
             config.webdriver.window_size.split(",")
             if config.webdriver.window_size
