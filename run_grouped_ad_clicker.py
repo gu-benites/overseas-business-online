@@ -607,15 +607,30 @@ def _log_cycle_click_summary(grouped_cycle_id: str, run_click_log_path: str | No
         f"Cycle click summary [{grouped_cycle_id}]: {len(click_rows)} successful click(s)."
     )
     appended_lines: list[str] = []
-    for city_name, rsw_id, final_url, click_timestamp, query, category, site_url in click_rows:
+    for (
+        click_id,
+        search_run_id,
+        city_name,
+        rsw_id,
+        final_url,
+        click_timestamp,
+        query,
+        category,
+        result_url,
+        result_position,
+    ) in click_rows:
         logger.info(
             "Cycle click: "
-            f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, final_url={final_url}, "
+            f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, run_id={search_run_id or '-'}, "
+            f"click_id={click_id or '-'}, position={result_position or '-'}, "
+            f"result_url={result_url}, final_url={final_url}, "
             f"timestamp={click_timestamp}, query={query}"
         )
         appended_lines.append(
             f"{click_timestamp} | city={city_name or '-'} | rsw_id={rsw_id or '-'} | "
-            f"query={query} | final_url={final_url}"
+            f"run_id={search_run_id or '-'} | click_id={click_id or '-'} | "
+            f"category={category} | position={result_position or '-'} | "
+            f"query={query} | result_url={result_url} | final_url={final_url}"
         )
     if run_click_log_path and appended_lines:
         with open(run_click_log_path, "a", encoding="utf-8") as file_obj:

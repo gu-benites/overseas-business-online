@@ -3,6 +3,7 @@ import json
 import random
 import urllib.parse
 import unicodedata
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import re
@@ -48,13 +49,44 @@ from webdriver import execute_presearch_trust_js_code, execute_stealth_js_code
 
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
-AdList = list[tuple[LinkElement, str, str]]
+AdList = list[tuple[LinkElement, str, str, int]]
 NonAdList = list[LinkElement]
 AllLinks = list[Union[AdList, NonAdList]]
 
 
 class BrowserSessionUnavailableError(RuntimeError):
     """Raised when the local Chrome/WebDriver session disappears mid-run."""
+
+
+class BrowserClickRecoveryRequired(BrowserSessionUnavailableError):
+    """Raised when the search-result click likely happened, but the browser died before landing handling."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        click_url: str,
+        category: str,
+        is_ad_element: bool,
+        click_time: str,
+        stats_snapshot: SearchStats,
+        active_proxy: Optional[str],
+        user_agent: Optional[str],
+        result_position: Optional[int],
+        result_url: Optional[str],
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.click_url = click_url
+        self.category = category
+        self.is_ad_element = is_ad_element
+        self.click_time = click_time
+        self.stats_snapshot = deepcopy(stats_snapshot)
+        self.active_proxy = active_proxy
+        self.user_agent = user_agent
+        self.result_position = result_position
+        self.result_url = result_url
 
 
 class SearchController:
@@ -225,6 +257,7 @@ class SearchController:
         self._stats = SearchStats()
         query_slug = re.sub(r"[^a-z0-9]+", "-", self._search_query.lower()).strip("-") or "query"
         self._run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{query_slug[:40]}"
+        self._click_sequence = 0
         self._screenshot_root = Path.cwd() / ".run_screenshots" / self._run_id
         self._screenshot_root.mkdir(parents=True, exist_ok=True)
         self._screenshot_counter = 0
@@ -386,6 +419,7 @@ class SearchController:
                 ad_link_element = ad[0]
                 ad_link = ad[1]
                 ad_title = ad[2].replace("\n", " ")
+                result_position = ad[3]
                 logger.info(f"Clicking to [{ad_title}]({ad_link})...")
                 self._save_step_screenshot("shopping_before_click")
 
@@ -393,13 +427,28 @@ class SearchController:
                     hooks.before_ad_click_hook(self._driver)
 
                 if config.behavior.send_to_android and self._android_device_id:
-                    self._handle_android_click(ad_link_element, ad_link, True, category="Shopping")
+                    self._handle_android_click(
+                        ad_link_element,
+                        ad_link,
+                        True,
+                        category="Shopping",
+                        result_position=result_position,
+                        result_url=ad_link,
+                    )
                 else:
                     self._handle_browser_click(
-                        ad_link_element, ad_link, True, original_window_handle, category="Shopping"
+                        ad_link_element,
+                        ad_link,
+                        True,
+                        original_window_handle,
+                        category="Shopping",
+                        result_position=result_position,
+                        result_url=ad_link,
                     )
                 self._save_step_screenshot("shopping_after_click")
 
+            except BrowserSessionUnavailableError:
+                raise
             except Exception as exp:
                 if self._is_browser_session_unavailable_exception(exp):
                     self._abort_due_to_browser_unavailable("shopping_ad_click", exp)
@@ -421,7 +470,9 @@ class SearchController:
             is_ad_element = isinstance(link, tuple)
 
             try:
-                link_element, link_url, ad_title = self._extract_link_info(link, is_ad_element)
+                link_element, link_url, ad_title, result_position = self._extract_link_info(
+                    link, is_ad_element
+                )
 
                 if self._hooks_enabled and is_ad_element:
                     hooks.before_ad_click_hook(self._driver)
@@ -435,10 +486,23 @@ class SearchController:
                 category = "Ad" if is_ad_element else "Non-ad"
 
                 if config.behavior.send_to_android and self._android_device_id:
-                    self._handle_android_click(link_element, link_url, is_ad_element, category)
+                    self._handle_android_click(
+                        link_element,
+                        link_url,
+                        is_ad_element,
+                        category,
+                        result_position=result_position,
+                        result_url=link_url,
+                    )
                 else:
                     self._handle_browser_click(
-                        link_element, link_url, is_ad_element, original_window_handle, category
+                        link_element,
+                        link_url,
+                        is_ad_element,
+                        original_window_handle,
+                        category,
+                        result_position=result_position,
+                        result_url=link_url,
                     )
                 self._save_step_screenshot(
                     f"{'ad' if is_ad_element else 'non_ad'}_after_click"
@@ -453,6 +517,8 @@ class SearchController:
                     "Skipping scroll into view..."
                 )
 
+            except BrowserSessionUnavailableError:
+                raise
             except Exception as exp:
                 if self._is_browser_session_unavailable_exception(exp):
                     self._abort_due_to_browser_unavailable("search_result_click", exp)
@@ -512,12 +578,14 @@ class SearchController:
             link_element = link[0]
             link_url = link[1]
             ad_title = link[2]
+            result_position = link[3]
         else:
             link_element = link
             link_url = link_element.get_attribute("href")
             ad_title = None
+            result_position = None
 
-        return (link_element, link_url, ad_title)
+        return (link_element, link_url, ad_title, result_position)
 
     def _extract_ad_title(self, ad: LinkElement) -> str:
         """Extract a resilient ad title from the SERP card."""
@@ -552,6 +620,8 @@ class SearchController:
         link_url: str,
         is_ad_element: bool,
         category: str = "Ad",
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
     ) -> None:
         """Handle opening link on Android device
 
@@ -591,7 +661,13 @@ class SearchController:
             else link_url
         )
 
-        self._update_click_stats(site_url, click_time, category)
+        self._update_click_stats(
+            site_url,
+            click_time,
+            category,
+            result_position=result_position,
+            result_url=result_url or url,
+        )
 
         if config.behavior.request_boost:
             boost_requests(url)
@@ -610,6 +686,8 @@ class SearchController:
         is_ad_element: bool,
         original_window_handle: str,
         category: str = "Ad",
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
     ) -> None:
         """Handle clicking in the browser
 
@@ -625,14 +703,21 @@ class SearchController:
         :param category: Specifies link category as Ad, Non-ad, or Shopping
         """
 
+        click_time = datetime.now().strftime("%H:%M:%S")
+        clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
+        tab_opened = False
+        click_stage = "before_open_tab"
+
         try:
             self._open_link_in_new_tab(link_element)
+            click_stage = "after_open_tab"
             self._ensure_browser_session_alive("browser_click_after_open_tab")
 
             if len(self._driver.window_handles) != 2:
                 logger.debug("Couldn't click! Scrolling element into view...")
                 self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
                 self._open_link_in_new_tab(link_element)
+                click_stage = "after_retry_open_tab"
                 self._ensure_browser_session_alive("browser_click_after_retry_open_tab")
 
             if len(self._driver.window_handles) != 2:
@@ -640,18 +725,19 @@ class SearchController:
                 return
             else:
                 logger.debug("Opened link in a new tab. Switching to tab...")
+                tab_opened = True
 
             for window_handle in self._driver.window_handles:
                 if window_handle != original_window_handle:
                     self._driver.switch_to.window(window_handle)
+                    click_stage = "after_tab_switch"
                     self._ensure_browser_session_alive("browser_click_after_tab_switch")
-                    click_time = datetime.now().strftime("%H:%M:%S")
                     self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
+                    click_stage = "landing_opened"
                     self._ensure_browser_session_alive("browser_click_after_landing_opened")
 
                     sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
                     self._ensure_browser_session_alive("browser_click_after_landing_wait")
-                    clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
                     final_landed_url = self._driver.current_url
                     logger.info(f"{category} click target URL: {clicked_target_url}")
                     logger.info(f"{category} final landed URL: {final_landed_url}")
@@ -676,6 +762,8 @@ class SearchController:
                         click_time,
                         category,
                         final_url=final_landed_url,
+                        result_position=result_position,
+                        result_url=result_url or clicked_target_url or link_url,
                     )
 
                     if config.behavior.request_boost:
@@ -697,8 +785,96 @@ class SearchController:
             sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
         except Exception as exp:
             if self._is_browser_session_unavailable_exception(exp):
+                if tab_opened and category in ("Ad", "Shopping"):
+                    logger.warning(
+                        "Browser session disappeared after the result click opened a new tab. "
+                        "Scheduling a fresh-browser landing recovery."
+                    )
+                    raise BrowserClickRecoveryRequired(
+                        str(exp),
+                        stage=click_stage,
+                        click_url=clicked_target_url or link_url,
+                        category=category,
+                        is_ad_element=is_ad_element,
+                        click_time=click_time,
+                        stats_snapshot=self._stats,
+                        active_proxy=getattr(self._driver, "_active_proxy", None),
+                        user_agent=getattr(self._driver, "_active_user_agent", None),
+                        result_position=result_position,
+                        result_url=result_url or clicked_target_url or link_url,
+                    ) from exp
                 self._abort_due_to_browser_unavailable("browser_click", exp)
             raise
+
+    def recover_interrupted_click(
+        self,
+        click_url: str,
+        *,
+        category: str,
+        is_ad_element: bool,
+        click_time: str,
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
+    ) -> None:
+        """Recover a click whose landing handling was interrupted by a local browser crash."""
+
+        logger.warning(
+            "Recovering interrupted %s click in a fresh browser session: %s",
+            category.lower(),
+            click_url,
+        )
+
+        execute_stealth_js_code(self._driver)
+
+        if config.webdriver.use_seleniumbase:
+            self._driver.uc_open_with_reconnect(click_url, reconnect_time=3)
+        else:
+            self._driver.get(click_url)
+
+        self._ensure_browser_session_alive("click_recovery_after_direct_open")
+        self._wait_for_page_settle(timeout=6)
+        self._ensure_browser_session_alive("click_recovery_after_settle")
+        self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened_recovery")
+
+        sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
+        self._ensure_browser_session_alive("click_recovery_after_landing_wait")
+
+        final_landed_url = self._driver.current_url
+        logger.info(f"{category} recovery target URL: {click_url}")
+        logger.info(f"{category} recovery landed URL: {final_landed_url}")
+
+        if self._hooks_enabled and category in ("Ad", "Shopping"):
+            hooks.after_ad_click_hook(self._driver)
+
+        self._maybe_click_whatsapp_interaction(category)
+        self._ensure_browser_session_alive("click_recovery_after_whatsapp")
+        self._start_random_action_threads()
+        self._ensure_browser_session_alive("click_recovery_after_random_actions")
+
+        url = (
+            "/".join(final_landed_url.split("/", maxsplit=3)[:3])
+            if category == "Shopping"
+            else (click_url if is_ad_element else final_landed_url)
+        )
+        self._update_click_stats(
+            url,
+            click_time,
+            category,
+            final_url=final_landed_url,
+            result_position=result_position,
+            result_url=result_url or click_url,
+        )
+
+        if config.behavior.request_boost:
+            boost_requests(final_landed_url)
+
+        wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
+        logger.debug(f"Waiting {wait_time} seconds on recovered {category.lower()} page...")
+        sleep(wait_time)
+        self._ensure_browser_session_alive("click_recovery_before_landing_close")
+        self._save_step_screenshot(
+            f"{category.lower().replace('-', '_')}_landing_before_close_recovery"
+        )
 
     def _maybe_click_whatsapp_interaction(self, category: str) -> None:
         """Optionally click a visible WhatsApp-style CTA on the landing page."""
@@ -900,12 +1076,18 @@ class SearchController:
         else:
             return random.choice(range(self._nonad_page_min_wait, self._nonad_page_max_wait))
 
+    def _next_click_id(self) -> str:
+        self._click_sequence += 1
+        return f"{self._run_id}_click_{self._click_sequence:03d}"
+
     def _update_click_stats(
         self,
         url: str,
         click_time: str,
         category: str,
         final_url: str | None = None,
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
     ) -> None:
         """Update click statistics
 
@@ -924,6 +1106,7 @@ class SearchController:
         elif category == "Shopping":
             self._stats.shopping_ads_clicked += 1
 
+        click_id = self._next_click_id()
         self._clicklogs_db_client.save_click(
             site_url=url,
             category=category,
@@ -933,6 +1116,10 @@ class SearchController:
             rsw_id=self._rsw_id,
             final_url=final_url,
             grouped_cycle_id=self._grouped_cycle_id,
+            click_id=click_id,
+            search_run_id=self._run_id,
+            result_position=result_position,
+            result_url=result_url or url,
         )
 
     def _start_random_scroll_thread(self) -> None:
@@ -998,7 +1185,7 @@ class SearchController:
             # for mobile user-agents
             mobile_shopping_ads = self._driver.find_elements(By.CLASS_NAME, "pla-unit-container")
             if mobile_shopping_ads:
-                for shopping_ad in mobile_shopping_ads[:5]:
+                for shopping_index, shopping_ad in enumerate(mobile_shopping_ads[:5], start=1):
                     ad = shopping_ad.find_element(By.TAG_NAME, "a")
                     shopping_ad_link = ad.get_attribute("href")
                     shopping_ad_title = shopping_ad.text.strip()
@@ -1009,6 +1196,7 @@ class SearchController:
                         shopping_ad_link,
                         shopping_ad_title,
                         shopping_ad_target_link,
+                        shopping_index,
                     )
                     logger.debug(ad_fields)
 
@@ -1026,7 +1214,7 @@ class SearchController:
                 commercial_unit_container = commercial_unit_containers[0]
                 shopping_ads = commercial_unit_container.find_elements(By.CLASS_NAME, "pla-unit")
 
-                for shopping_ad in shopping_ads[:5]:
+                for shopping_index, shopping_ad in enumerate(shopping_ads[:5], start=1):
                     ad = shopping_ad.find_element(By.TAG_NAME, "a")
                     shopping_ad_link = ad.get_attribute("href")
 
@@ -1039,6 +1227,7 @@ class SearchController:
                         shopping_ad_link,
                         shopping_ad_title,
                         shopping_ad_target_link,
+                        shopping_index,
                     )
                     logger.debug(ad_fields)
 
@@ -1072,6 +1261,7 @@ class SearchController:
                 ad_link = ad[1]
                 ad_title = ad[2].replace("\n", " ")
                 ad_target_link = ad[3]
+                ad_position = ad[4]
                 logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
 
                 if self._exclude_list:
@@ -1085,10 +1275,10 @@ class SearchController:
                             break
                     else:
                         logger.info("======= Found a Shopping Ad =======")
-                        shopping_ad_links.append((ad[0], ad_link, ad_title))
+                        shopping_ad_links.append((ad[0], ad_link, ad_title, ad_position))
                 else:
                     logger.info("======= Found a Shopping Ad =======")
-                    shopping_ad_links.append((ad[0], ad_link, ad_title))
+                    shopping_ad_links.append((ad[0], ad_link, ad_title, ad_position))
 
             return shopping_ad_links
 
@@ -1157,6 +1347,7 @@ class SearchController:
                     if ad_link not in links:
                         links.append(ad_link)
                         cleaned_ads.append(ad)
+            ad_positions = {id(ad): position for position, ad in enumerate(cleaned_ads, start=1)}
 
             self._stats.ads_found = len(cleaned_ads)
 
@@ -1185,6 +1376,7 @@ class SearchController:
                 ad_link = ad.get_attribute("href")
                 ad_target_link = ad.get_attribute("data-pcu") or ad_link
                 ad_title = self._extract_ad_title(ad)
+                ad_position = ad_positions.get(id(ad))
                 logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
 
                 if self._ad_allowlist:
@@ -1222,10 +1414,10 @@ class SearchController:
                             break
                     else:
                         logger.info("======= Found an Ad =======")
-                        ad_links.append((ad, ad_link, ad_title))
+                        ad_links.append((ad, ad_link, ad_title, ad_position))
                 else:
                     logger.info("======= Found an Ad =======")
-                    ad_links.append((ad, ad_link, ad_title))
+                    ad_links.append((ad, ad_link, ad_title, ad_position))
 
             return ad_links
         except Exception as exp:

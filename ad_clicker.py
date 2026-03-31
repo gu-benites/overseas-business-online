@@ -17,7 +17,11 @@ from clicklogs_db import ClickLogsDB
 from config_reader import config
 from logger import logger, update_log_formats
 from proxy import get_proxies
-from search_controller import BrowserSessionUnavailableError, SearchController
+from search_controller import (
+    BrowserClickRecoveryRequired,
+    BrowserSessionUnavailableError,
+    SearchController,
+)
 from stats import SearchStats
 from utils import (
     get_queries,
@@ -232,6 +236,7 @@ def main():
         int(getattr(config.behavior, "browser_unavailable_restart_attempts", 2) or 0),
     )
     browser_restart_count = 0
+    pending_click_recovery = None
 
     try:
         if args.check_stealth:
@@ -259,9 +264,6 @@ def main():
                 driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
 
             try:
-                if config.behavior.hooks_enabled:
-                    hooks.before_search_hook(driver)
-
                 search_controller = SearchController(
                     driver,
                     current_query,
@@ -276,6 +278,34 @@ def main():
 
                 if args.device_id:
                     search_controller.assign_android_device(args.device_id)
+
+                if pending_click_recovery is not None:
+                    search_controller._stats = pending_click_recovery.stats_snapshot
+                    search_controller.recover_interrupted_click(
+                        pending_click_recovery.click_url,
+                        category=pending_click_recovery.category,
+                        is_ad_element=pending_click_recovery.is_ad_element,
+                        click_time=pending_click_recovery.click_time,
+                        result_position=pending_click_recovery.result_position,
+                        result_url=pending_click_recovery.result_url,
+                    )
+                    pending_click_recovery = None
+
+                    if config.behavior.hooks_enabled:
+                        hooks.after_clicks_hook(driver)
+
+                    logger.info(search_controller.stats)
+                    if args.json_summary:
+                        print(
+                            "JSON_SUMMARY:"
+                            + json.dumps(asdict(search_controller.stats), ensure_ascii=False),
+                            flush=True,
+                        )
+                        json_summary_emitted = True
+                    break
+
+                if config.behavior.hooks_enabled:
+                    hooks.before_search_hook(driver)
 
                 ads, non_ad_links, shopping_ads = search_controller.search_for_ads(
                     non_ad_domains=domains
@@ -369,6 +399,44 @@ def main():
                     json_summary_emitted = True
                 break
 
+            except BrowserClickRecoveryRequired as exp:
+                pending_click_recovery = exp
+                if browser_restart_count >= browser_restart_limit:
+                    raise
+
+                logger.warning(
+                    "Browser session disappeared after the click was already dispatched. "
+                    "Restarting browser session "
+                    f"{browser_restart_count + 1}/{browser_restart_limit} to finish landing handling."
+                )
+                browser_restart_count += 1
+
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+                profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
+                _cleanup_reserved_runtime_dir(profile_dir)
+                runtime_driver_dir = (
+                    getattr(driver, "_runtime_driver_dir", None) if driver else None
+                )
+                _cleanup_reserved_runtime_dir(runtime_driver_dir)
+
+                if proxy and config.webdriver.auth:
+                    plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
+                    _cleanup_reserved_runtime_dir(plugin_folder)
+
+                driver = None
+                country_code = None
+                search_controller = None
+                proxy = exp.active_proxy or proxy
+                user_agent = exp.user_agent or user_agent
+                plugin_folder_name = "".join(random.choices(string.ascii_lowercase, k=5))
+                sleep(1 * config.behavior.wait_factor)
+                continue
+
             except BrowserSessionUnavailableError:
                 attempted_clicks = bool(
                     search_controller
@@ -395,6 +463,10 @@ def main():
 
                 profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
                 _cleanup_reserved_runtime_dir(profile_dir)
+                runtime_driver_dir = (
+                    getattr(driver, "_runtime_driver_dir", None) if driver else None
+                )
+                _cleanup_reserved_runtime_dir(runtime_driver_dir)
 
                 if proxy and config.webdriver.auth:
                     plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
@@ -460,6 +532,8 @@ def main():
 
         profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
         _cleanup_reserved_runtime_dir(profile_dir)
+        runtime_driver_dir = getattr(driver, "_runtime_driver_dir", None) if driver else None
+        _cleanup_reserved_runtime_dir(runtime_driver_dir)
 
         if proxy and config.webdriver.auth:
             plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name

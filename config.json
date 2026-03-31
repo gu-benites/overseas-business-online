@@ -14,6 +14,8 @@
         "ss_on_exception": false,
         "window_size": "",
         "shift_windows": false,
+        "prefer_headless": true,
+        "isolated_chromedriver_per_run": true,
         "use_seleniumbase": false
     },
     "behavior": {

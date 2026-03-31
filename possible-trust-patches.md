@@ -23,6 +23,8 @@ Status legend:
 - [x] Cap rotating window sizes to the real X display dimensions so viewport size does not exceed `screen.width` / `screen.height`.
 - [x] Stop forcing CDP `platform=Linux` in the UA override payload for every session.
 - [x] Prefer explicit realistic window sizing over `maximize_window()` on this Chrome 146 + Xvfb stack, since maximize is failing and was producing inconsistent fallbacks.
+- [x] Prefer headless Chrome as the primary mode on this VPS branch because the ARM baseline is currently getting better success in headless than in headful/Xvfb.
+- [x] Stop sharing one live UC/ChromeDriver binary across concurrent workers. Each browser run now gets its own reserved ChromeDriver copy.
 
 ## High-Value Remaining Patches
 
@@ -35,6 +37,7 @@ Status legend:
 - [ ] Tune proxy session reuse and provider settings if captcha pressure remains high after browser-identity fixes.
 - [ ] Evaluate whether `identity_mode = native_linux` should become the default on x86_64 if the native Chrome fingerprint outperforms the curated UA pool.
 - [ ] Re-check WebGL, canvas, and font surfaces on this VPS after the UA/window fixes, because x86_64 Chrome 146 may still differ materially from the old ARM stack.
+- [ ] Decide whether the isolated per-run ChromeDriver path should also be ported to `main` after soak-testing it on this VPS branch.
 
 ## Current Working Theory
 

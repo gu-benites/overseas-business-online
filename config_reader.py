@@ -27,6 +27,8 @@ class WebdriverParams:
     ss_on_exception: Optional[bool] = False
     window_size: Optional[str] = ""
     shift_windows: Optional[bool] = False
+    prefer_headless: Optional[bool] = False
+    isolated_chromedriver_per_run: Optional[bool] = False
     use_seleniumbase: Optional[bool] = False
 
 
@@ -103,6 +105,10 @@ class ConfigReader:
             ss_on_exception=config["webdriver"]["ss_on_exception"],
             window_size=config["webdriver"]["window_size"],
             shift_windows=config["webdriver"]["shift_windows"],
+            prefer_headless=config["webdriver"].get("prefer_headless", False),
+            isolated_chromedriver_per_run=config["webdriver"].get(
+                "isolated_chromedriver_per_run", False
+            ),
             use_seleniumbase=config["webdriver"]["use_seleniumbase"],
         )
 

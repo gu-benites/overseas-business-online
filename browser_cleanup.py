@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 UC_PROFILE_BASE_DIR = PROJECT_ROOT / ".tmp_uc_profiles"
 LEGACY_TMP_UC_PROFILE_BASE_DIR = Path("/tmp/uc_profiles")
 PROXY_AUTH_PLUGIN_BASE_DIR = PROJECT_ROOT / "proxy_auth_plugin"
+ISOLATED_CHROMEDRIVER_BASE_DIR = PROJECT_ROOT / ".runtime" / "isolated_chromedrivers"
 RUNTIME_RESERVATION_DIR = PROJECT_ROOT / ".runtime" / "cleanup_reservations"
 
 
@@ -198,6 +199,7 @@ def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:
         UC_PROFILE_BASE_DIR,
         LEGACY_TMP_UC_PROFILE_BASE_DIR,
         PROXY_AUTH_PLUGIN_BASE_DIR,
+        ISOLATED_CHROMEDRIVER_BASE_DIR,
     ):
         if not base_dir.exists():
             continue

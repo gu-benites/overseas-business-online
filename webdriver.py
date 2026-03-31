@@ -6,6 +6,7 @@ import string
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from time import sleep
 from typing import Optional, Union
@@ -34,6 +35,11 @@ except ImportError:
     import undetected_chromedriver
 
 try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
     import pyautogui
 except BaseException as exp:
     pyautogui = None
@@ -43,6 +49,7 @@ else:
 
 from config_reader import config
 from browser_cleanup import (
+    ISOLATED_CHROMEDRIVER_BASE_DIR,
     UC_PROFILE_BASE_DIR,
     cleanup_stale_uc_profiles,
     release_runtime_dir,
@@ -68,6 +75,8 @@ COMMON_NOTEBOOK_WINDOW_SIZES = (
     (1920, 1080),
 )
 COMMON_NOTEBOOK_WINDOW_WEIGHTS = (45, 25, 20, 10)
+UC_DEFAULT_WINDOW_ARGS = {"--window-size=1920,1080", "--start-maximized"}
+UC_DRIVER_SEED_LOCK_PATH = PROJECT_ROOT / ".runtime" / "locks" / "uc_driver_seed.lock"
 
 
 def _bootstrap_linux_display() -> None:
@@ -397,6 +406,113 @@ def _get_display_dimensions(display_value: str | None) -> Optional[tuple[int, in
     return width, height
 
 
+@contextmanager
+def _uc_seed_lock():
+    UC_DRIVER_SEED_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(UC_DRIVER_SEED_LOCK_PATH, "a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _get_chromedriver_major_version(driver_path: Path) -> Optional[int]:
+    if not driver_path.exists():
+        return None
+
+    try:
+        version_output = subprocess.check_output(
+            [str(driver_path), "--version"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception as exp:
+        logger.debug(f"Failed to read ChromeDriver version from {driver_path}: {exp}")
+        return None
+
+    match = re.search(r"ChromeDriver\s+(\d+)\.", version_output)
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def _ensure_uc_seed_driver(browser_major_version: Optional[int]) -> Path:
+    """Ensure a patched shared UC seed driver exists for per-run isolated copies."""
+
+    system_driver = Path("/usr/bin/chromedriver")
+    if system_driver.exists():
+        return system_driver
+
+    shared_driver = Path(_get_driver_exe_path()).expanduser()
+    existing_major = _get_chromedriver_major_version(shared_driver)
+    if (
+        shared_driver.exists()
+        and (
+            browser_major_version is None
+            or existing_major is None
+            or existing_major == browser_major_version
+        )
+    ):
+        return shared_driver
+
+    with _uc_seed_lock():
+        existing_major = _get_chromedriver_major_version(shared_driver)
+        if (
+            shared_driver.exists()
+            and (
+                browser_major_version is None
+                or existing_major is None
+                or existing_major == browser_major_version
+            )
+        ):
+            return shared_driver
+
+        logger.info(
+            "Bootstrapping shared UC seed ChromeDriver for later isolated per-run copies: "
+            f"target_major={browser_major_version or 'auto'}"
+        )
+        patcher = undetected_chromedriver.patcher.Patcher(
+            version_main=browser_major_version or 0,
+            user_multi_procs=False,
+        )
+        patcher.auto()
+        seed_driver = Path(patcher.executable_path).expanduser()
+        seed_driver.chmod(0o755)
+        return seed_driver
+
+
+def _prepare_isolated_driver_executable(
+    browser_major_version: Optional[int],
+) -> tuple[str, Path]:
+    """Prepare a reserved ChromeDriver directory and executable for one browser run."""
+
+    seed_driver = _ensure_uc_seed_driver(browser_major_version)
+    driver_dir = reserve_unique_runtime_dir(
+        ISOLATED_CHROMEDRIVER_BASE_DIR,
+        prefix="driver_",
+        metadata={
+            "kind": "chromedriver_runtime",
+            "browser_major_version": browser_major_version,
+            "seed_driver": str(seed_driver),
+        },
+    )
+    driver_dir.mkdir(parents=True, exist_ok=True)
+
+    executable_name = seed_driver.name or "chromedriver"
+    isolated_driver_path = driver_dir / executable_name
+    shutil.copy2(seed_driver, isolated_driver_path)
+    isolated_driver_path.chmod(0o755)
+    logger.debug(
+        "Prepared isolated ChromeDriver copy for this browser run: "
+        f"seed={seed_driver}, isolated={isolated_driver_path}"
+    )
+    return str(isolated_driver_path), driver_dir
+
+
 class CustomChrome(undetected_chromedriver.Chrome):
     """Modified Chrome implementation"""
 
@@ -508,15 +624,25 @@ def create_webdriver(
 
     geolocation_db_client = GeolocationDB()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
-    headless_fallback = sys.platform.startswith("linux") and not has_display
+    prefer_headless = bool(getattr(config.webdriver, "prefer_headless", False))
+    headless_mode = sys.platform.startswith("linux") and (prefer_headless or not has_display)
     display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
     rotating_window_size = (
         None
         if config.webdriver.window_size
         else _choose_rotating_window_size(display_dimensions)
     )
+    startup_window_size: Optional[tuple[int, int]] = None
+    if config.webdriver.window_size:
+        width, height = config.webdriver.window_size.split(",")
+        startup_window_size = (int(width), int(height))
+    elif rotating_window_size:
+        startup_window_size = (int(rotating_window_size[0]), int(rotating_window_size[1]))
+    elif display_dimensions:
+        startup_window_size = (int(display_dimensions[0]), int(display_dimensions[1]))
 
-    chrome_options = undetected_chromedriver.ChromeOptions()
+    chrome_options = ChromeOptions()
+    chrome_options._suppress_uc_default_window_args = True
     chrome_prefs = {
         "webrtc.ip_handling_policy": "disable_non_proxied_udp",
         "webrtc.multiple_routes_enabled": False,
@@ -548,14 +674,25 @@ def create_webdriver(
     chrome_options.add_argument("--dns-prefetch-disable")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
-    if headless_fallback:
-        fallback_width, fallback_height = rotating_window_size or (1366, 768)
-        logger.warning(
-            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
-            "Falling back to headless Chrome."
-        )
+    if headless_mode:
+        fallback_width, fallback_height = startup_window_size or (1366, 768)
+        if prefer_headless and has_display:
+            logger.info(
+                "Running Chrome in configured headless mode on this VPS because "
+                "headless is currently outperforming headful mode."
+            )
+        else:
+            logger.warning(
+                f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+                "Falling back to headless Chrome."
+            )
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument(f"--window-size={fallback_width},{fallback_height}")
+    elif startup_window_size:
+        chrome_options.add_argument(
+            f"--window-size={startup_window_size[0]},{startup_window_size[1]}"
+        )
+        chrome_options.add_argument("--window-position=0,0")
     if user_agent:
         chrome_options.add_argument(f"--user-agent={user_agent}")
 
@@ -599,17 +736,24 @@ def create_webdriver(
 
     country_code = None
     driver = None
+    runtime_driver_dir = None
 
     try:
         multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
         multi_procs_enabled = multi_browser_flag_file.exists()
-        driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
 
         browser_binary_path = _get_browser_binary_path()
         browser_major_version = get_browser_major_version()
         if browser_major_version:
             logger.debug(f"Detected browser major version: {browser_major_version}")
         _ensure_local_uc_driver_cache()
+        if getattr(config.webdriver, "isolated_chromedriver_per_run", False):
+            driver_exe_path, runtime_driver_dir = _prepare_isolated_driver_executable(
+                browser_major_version
+            )
+            multi_procs_enabled = False
+        else:
+            driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
         if proxy:
             if config.webdriver.auth:
                 username, password, host, port = _parse_proxy_components(proxy)
@@ -667,11 +811,13 @@ def create_webdriver(
             browser_executable_path=browser_binary_path,
             driver_executable_path=driver_exe_path,
             options=chrome_options,
+            headless=headless_mode,
             version_main=browser_major_version,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=True,
         )
         driver._active_proxy = proxy if proxy else None
+        driver._active_user_agent = user_agent
 
         if proxy:
             accuracy = 95
@@ -710,22 +856,19 @@ def create_webdriver(
             )
 
         driver._runtime_profile_dir = str(profile_dir)
+        driver._runtime_driver_dir = str(runtime_driver_dir) if runtime_driver_dir else None
 
-        if headless_fallback:
+        if headless_mode:
             logger.debug("Skipping window maximize/position because Chrome is running headless.")
-        elif config.webdriver.window_size:
-            width, height = config.webdriver.window_size.split(",")
-            logger.debug(f"Setting window size as {width}x{height} px")
-            driver.set_window_size(width, height)
-        elif rotating_window_size:
-            width, height = rotating_window_size
-            logger.debug(f"Setting rotating window size as {width}x{height} px")
+        elif startup_window_size:
+            width, height = startup_window_size
+            logger.debug(f"Setting startup-aligned window size as {width}x{height} px")
             driver.set_window_size(width, height)
         else:
             logger.debug("Maximizing window...")
             driver.maximize_window()
 
-        if config.webdriver.shift_windows and not headless_fallback:
+        if config.webdriver.shift_windows and not headless_mode:
             width, height = (
                 config.webdriver.window_size.split(",")
                 if config.webdriver.window_size
@@ -743,7 +886,23 @@ def create_webdriver(
 
         if release_runtime_dir(profile_dir):
             shutil.rmtree(profile_dir, ignore_errors=True)
+        if runtime_driver_dir and release_runtime_dir(runtime_driver_dir):
+            shutil.rmtree(runtime_driver_dir, ignore_errors=True)
         raise
+
+
+class ChromeOptions(undetected_chromedriver.ChromeOptions):
+    """Chrome options wrapper that suppresses UC's hardcoded oversized startup window flags."""
+
+    def add_argument(self, argument):
+        if (
+            getattr(self, "_suppress_uc_default_window_args", False)
+            and argument in UC_DEFAULT_WINDOW_ARGS
+        ):
+            logger.debug(f"Suppressing undetected_chromedriver default argument: {argument}")
+            return
+
+        return super().add_argument(argument)
 
 
 def create_seleniumbase_driver(
@@ -764,13 +923,22 @@ def create_seleniumbase_driver(
     browser_binary_path = _get_browser_binary_path()
     _ensure_seleniumbase_uses_system_chromedriver()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
-    headless_fallback = sys.platform.startswith("linux") and not has_display
+    prefer_headless = bool(getattr(config.webdriver, "prefer_headless", False))
+    headless_mode = sys.platform.startswith("linux") and (prefer_headless or not has_display)
     display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
     rotating_window_size = (
         None
         if config.webdriver.window_size
         else _choose_rotating_window_size(display_dimensions)
     )
+    startup_window_size: Optional[tuple[int, int]] = None
+    if config.webdriver.window_size:
+        width, height = config.webdriver.window_size.split(",")
+        startup_window_size = (int(width), int(height))
+    elif rotating_window_size:
+        startup_window_size = (int(rotating_window_size[0]), int(rotating_window_size[1]))
+    elif display_dimensions:
+        startup_window_size = (int(display_dimensions[0]), int(display_dimensions[1]))
 
     country_code = None
     locale_code = None
@@ -801,7 +969,7 @@ def create_seleniumbase_driver(
     driver = seleniumbase.get_driver(
         browser_name="chrome",
         undetectable=False,
-        headless2=headless_fallback,
+        headless2=headless_mode,
         do_not_track=True,
         user_agent=user_agent,
         proxy_string=proxy or None,
@@ -846,27 +1014,30 @@ def create_seleniumbase_driver(
         except Exception as exp:
             logger.debug(f"Skipping SeleniumBase CDP geo/timezone override: {exp}")
     driver._active_proxy = proxy if proxy else None
+    driver._active_user_agent = user_agent
 
     # handle window size and position
-    if headless_fallback:
-        logger.warning(
-            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
-            "Falling back to headless SeleniumBase Chrome."
-        )
+    if headless_mode:
+        if prefer_headless and has_display:
+            logger.info(
+                "Running SeleniumBase Chrome in configured headless mode on this VPS because "
+                "headless is currently outperforming headful mode."
+            )
+        else:
+            logger.warning(
+                f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+                "Falling back to headless SeleniumBase Chrome."
+            )
         logger.debug("Skipping window maximize/position because SeleniumBase Chrome is headless.")
-    elif config.webdriver.window_size:
-        width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
-        driver.set_window_size(int(width), int(height))
-    elif rotating_window_size:
-        width, height = rotating_window_size
-        logger.debug(f"Setting rotating window size as {width}x{height} px")
+    elif startup_window_size:
+        width, height = startup_window_size
+        logger.debug(f"Setting startup-aligned window size as {width}x{height} px")
         driver.set_window_size(int(width), int(height))
     else:
         logger.debug("Maximizing window...")
         driver.maximize_window()
 
-    if config.webdriver.shift_windows and not headless_fallback:
+    if config.webdriver.shift_windows and not headless_mode:
         width, height = (
             config.webdriver.window_size.split(",")
             if config.webdriver.window_size
