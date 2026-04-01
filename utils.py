@@ -71,12 +71,9 @@ def get_random_user_agent_string() -> Optional[str]:
     :returns: User agent string
     """
 
-    identity_mode = getattr(config.webdriver, "identity_mode", "native_linux")
-    if identity_mode != "legacy":
-        logger.info(
-            f"Identity mode '{identity_mode}' enabled. "
-            "Using browser native Linux desktop identity."
-        )
+    identity_mode = getattr(config.webdriver, "identity_mode", "legacy")
+    if identity_mode == "native_linux":
+        logger.info("Identity mode 'native_linux' enabled. Using browser native Linux desktop identity.")
         return None
 
     all_user_agents = _get_user_agents(config.paths.user_agents)
@@ -525,6 +522,85 @@ def add_cookies(driver: undetected_chromedriver.Chrome) -> None:
             cookie["sameSite"] = "None" if cookie["secure"] else "Lax"
 
         driver.add_cookie(cookie)
+
+
+def build_google_seed_cookies(
+    *,
+    locale_code: Optional[str],
+    country_code: Optional[str],
+    domain_hint: Optional[str] = None,
+    include_consent: bool = True,
+) -> list[dict[str, Any]]:
+    """Build a small, low-risk Google seed-cookie set for cold profiles."""
+
+    normalized_locale = str(locale_code or "").strip() or "en-US"
+    normalized_country = str(country_code or "").strip().lower() or "us"
+    language_code = normalized_locale.split("-", 1)[0].lower()
+    cookies: list[dict[str, Any]] = [
+        {
+            "name": "PREF",
+            "value": f"hl={normalized_locale}&gl={normalized_country}",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "Lax",
+        }
+    ]
+
+    if include_consent:
+        cookies.extend(
+            [
+                {
+                    "name": "CONSENT",
+                    "value": f"YES+cb.20210328-17-p0.{language_code}+FX+917",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": False,
+                    "sameSite": "None",
+                },
+                {
+                    "name": "SOCS",
+                    "value": "CAESHAgBEhIaAB",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": False,
+                    "sameSite": "None",
+                },
+            ]
+        )
+
+    return cookies
+
+
+def add_seed_cookies(
+    driver: undetected_chromedriver.Chrome,
+    cookies: list[dict[str, Any]],
+) -> int:
+    """Add a small seed-cookie set, normalizing SameSite values for Selenium."""
+
+    added_count = 0
+    for cookie in cookies:
+        cookie_payload = dict(cookie)
+        same_site = str(cookie_payload.get("sameSite", "") or "").strip().lower()
+        if same_site == "strict":
+            cookie_payload["sameSite"] = "Strict"
+        elif same_site == "none":
+            cookie_payload["sameSite"] = "None"
+        else:
+            cookie_payload["sameSite"] = "Lax"
+
+        try:
+            driver.add_cookie(cookie_payload)
+            added_count += 1
+        except Exception as exp:
+            logger.debug(
+                "Failed to add seed cookie '%s' for domain '%s': %s",
+                cookie_payload.get("name"),
+                cookie_payload.get("domain"),
+                exp,
+            )
+
+    return added_count
 
 
 def solve_recaptcha(

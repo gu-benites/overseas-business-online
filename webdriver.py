@@ -1,10 +1,12 @@
 import os
 import platform
 import random
+import re
 import string
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from time import sleep
 from typing import Optional, Union
@@ -33,6 +35,11 @@ except ImportError:
     import undetected_chromedriver
 
 try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
     import pyautogui
 except BaseException as exp:
     pyautogui = None
@@ -41,24 +48,48 @@ else:
     PYAUTOGUI_IMPORT_ERROR = None
 
 from config_reader import config
-from browser_cleanup import UC_PROFILE_BASE_DIR, cleanup_stale_uc_profiles
+from browser_cleanup import (
+    CITY_PROFILE_BASE_DIR,
+    ISOLATED_CHROMEDRIVER_BASE_DIR,
+    UC_PROFILE_BASE_DIR,
+    cleanup_stale_uc_profiles,
+    release_runtime_dir,
+    reserve_runtime_dir,
+    reserve_unique_runtime_dir,
+)
 from geolocation_db import GeolocationDB
 from logger import logger
+from profile_state_db import ProfileStateDB, build_profile_key
 from proxy import (
     apply_iproyal_sticky_session,
     extract_proxy_session_id,
     install_plugin,
     parse_proxy_value,
 )
-from utils import get_location, get_locale_language, get_random_sleep
+from utils import (
+    get_browser_major_version,
+    get_location,
+    get_locale_language,
+    get_proxy_exit_ip,
+    get_random_sleep,
+)
 
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
 PROJECT_ROOT = Path(__file__).resolve().parent
+COMMON_NOTEBOOK_WINDOW_SIZES = (
+    (1366, 768),
+    (1536, 864),
+    (1600, 900),
+    (1920, 1080),
+)
+COMMON_NOTEBOOK_WINDOW_WEIGHTS = (45, 25, 20, 10)
+UC_DEFAULT_WINDOW_ARGS = {"--window-size=1920,1080", "--start-maximized"}
+UC_DRIVER_SEED_LOCK_PATH = PROJECT_ROOT / ".runtime" / "locks" / "uc_driver_seed.lock"
 
 
 def _bootstrap_linux_display() -> None:
-    """Attach CLI-launched runs to the persistent desktop display when available."""
+    """Attach to the persistent VPS Xvfb display when available."""
 
     if not sys.platform.startswith("linux"):
         return
@@ -74,6 +105,36 @@ def _bootstrap_linux_display() -> None:
 
 
 _bootstrap_linux_display()
+
+
+def _choose_rotating_window_size(
+    display_dimensions: Optional[tuple[int, int]] = None,
+) -> tuple[int, int]:
+    """Pick a realistic notebook-class window size, favoring lower resolutions."""
+
+    candidate_sizes = list(zip(COMMON_NOTEBOOK_WINDOW_SIZES, COMMON_NOTEBOOK_WINDOW_WEIGHTS))
+    if display_dimensions:
+        display_width, display_height = display_dimensions
+        fitting_sizes = [
+            (size, weight)
+            for size, weight in candidate_sizes
+            if size[0] <= display_width and size[1] <= display_height
+        ]
+        if fitting_sizes:
+            candidate_sizes = fitting_sizes
+        else:
+            width = max(1024, display_width)
+            height = max(600, display_height)
+            logger.debug(
+                "No rotating notebook size fits the active display. "
+                f"Using display dimensions {width}x{height}."
+            )
+            return width, height
+
+    sizes, weights = zip(*candidate_sizes)
+    width, height = random.choices(sizes, weights=weights, k=1)[0]
+    logger.debug(f"Selected rotating notebook window size: {width}x{height}")
+    return width, height
 
 
 def _build_accept_language_header(locale_code: Optional[str]) -> Optional[str]:
@@ -108,9 +169,11 @@ def _resolve_proxy_locale(country_code: Optional[str]) -> tuple[Optional[str], O
 def _apply_browser_locale_overrides(
     driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
     *,
+    locale_code: Optional[str],
     accept_language: Optional[str],
+    user_agent: Optional[str],
 ) -> None:
-    if not accept_language:
+    if not locale_code and not accept_language:
         return
 
     try:
@@ -118,13 +181,23 @@ def _apply_browser_locale_overrides(
     except Exception as exp:
         logger.debug(f"Failed to enable CDP Network domain for locale override: {exp}")
 
+    if accept_language:
+        try:
+            driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {"Accept-Language": accept_language}},
+            )
+        except Exception as exp:
+            logger.debug(f"Failed to set Accept-Language header override: {exp}")
+
     try:
-        driver.execute_cdp_cmd(
-            "Network.setExtraHTTPHeaders",
-            {"headers": {"Accept-Language": accept_language}},
-        )
+        effective_user_agent = user_agent or driver.execute_script("return navigator.userAgent")
+        override_payload = {"userAgent": effective_user_agent}
+        if accept_language:
+            override_payload["acceptLanguage"] = accept_language
+        driver.execute_cdp_cmd("Emulation.setUserAgentOverride", override_payload)
     except Exception as exp:
-        logger.debug(f"Failed to set Accept-Language header override: {exp}")
+        logger.debug(f"Failed to apply locale/user-agent override: {exp}")
 
 
 def _apply_sticky_session_to_proxy(proxy: str, lifetime: str = "30m") -> str:
@@ -161,6 +234,108 @@ def _infer_country_code_from_proxy(proxy: str) -> Optional[str]:
             except Exception:
                 return None
     return None
+
+
+def _prepare_profile_runtime(
+    *,
+    city_name: Optional[str],
+    rsw_id: Optional[str],
+    proxy: Optional[str],
+) -> dict[str, object]:
+    """Resolve either a reusable city profile or a per-run ephemeral profile."""
+
+    cleanup_result = cleanup_stale_uc_profiles(max_age_seconds=0)
+    if cleanup_result["removed_dirs"]:
+        freed_mb = cleanup_result["freed_bytes"] / (1024 * 1024)
+        logger.info(
+            "UC profile cleanup before browser startup: "
+            f"removed {cleanup_result['removed_dirs']} stale profile dir(s), "
+            f"freed ~{freed_mb:.1f} MiB."
+        )
+    profile_state_db = ProfileStateDB()
+    profile_state_db.cleanup_expired_or_recycled_profiles()
+
+    reuse_enabled = bool(getattr(config.webdriver, "profile_reuse_enabled", False))
+    reuse_key_mode = str(getattr(config.webdriver, "profile_reuse_key", "city") or "city")
+    ttl_minutes = max(1, int(getattr(config.webdriver, "profile_reuse_ttl_minutes", 45) or 45))
+    current_proxy_ip = get_proxy_exit_ip(proxy, max_retries=1, retry_sleep_seconds=1) if proxy else None
+    current_proxy_session_id = _extract_proxy_session_id(proxy) if proxy else None
+
+    if reuse_enabled and city_name:
+        profile_key = build_profile_key(city_name, reuse_key_mode)
+        state = profile_state_db.ensure_profile(
+            profile_key=profile_key,
+            city_name=city_name,
+            rsw_id=rsw_id,
+            ttl_minutes=ttl_minutes,
+        )
+        profile_dir = Path(state.profile_dir)
+        profile_dir.parent.mkdir(parents=True, exist_ok=True)
+        between_run_ip_changed = bool(
+            current_proxy_ip and state.last_proxy_ip and current_proxy_ip != state.last_proxy_ip
+        )
+        seed_required = not profile_dir.exists() or state.last_seeded_at is None
+        recycle_pending = state.status == "recycle_pending"
+
+        if recycle_pending and profile_dir.exists():
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            profile_state_db.reset_profile(profile_key)
+            seed_required = True
+            between_run_ip_changed = False
+
+        try:
+            reserve_runtime_dir(
+                profile_dir,
+                metadata={
+                    "kind": "city_profile",
+                    "profile_key": profile_key,
+                    "city_name": city_name,
+                },
+            )
+        except RuntimeError:
+            logger.warning(
+                "Reusable city profile '%s' is already in use by another live process. "
+                "Falling back to an ephemeral profile for this run.",
+                profile_key,
+            )
+        else:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "profile_dir": profile_dir,
+                "persistent": True,
+                "profile_key": profile_key,
+                "profile_state_db": profile_state_db,
+                "ttl_minutes": ttl_minutes,
+                "current_proxy_ip": current_proxy_ip,
+                "current_proxy_session_id": current_proxy_session_id,
+                "between_run_ip_changed": between_run_ip_changed,
+                "seed_required": seed_required,
+                "cleanup_policy": (
+                    "city_profile_ip_changed_cleanup"
+                    if between_run_ip_changed
+                    and bool(getattr(config.webdriver, "profile_soft_cleanup_on_ip_change", True))
+                    else "city_profile_soft_cleanup"
+                ),
+            }
+
+    profile_dir = reserve_unique_runtime_dir(
+        UC_PROFILE_BASE_DIR,
+        prefix="profile_",
+        metadata={"kind": "uc_profile"},
+    )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "profile_dir": profile_dir,
+        "persistent": False,
+        "profile_key": None,
+        "profile_state_db": profile_state_db,
+        "ttl_minutes": ttl_minutes,
+        "current_proxy_ip": current_proxy_ip,
+        "current_proxy_session_id": current_proxy_session_id,
+        "between_run_ip_changed": False,
+        "seed_required": False,
+        "cleanup_policy": "ephemeral",
+    }
 
 
 def _ensure_seleniumbase_uses_system_chromedriver() -> None:
@@ -243,38 +418,61 @@ def _get_browser_binary_path() -> str:
     )
 
 
-def _resolve_driver_source_executable() -> Path:
-    """Resolve a concrete chromedriver binary to copy for this worker.
+def _ensure_local_uc_driver_cache() -> None:
+    """Keep the UC driver cache aligned with the system architecture on ARM hosts."""
 
-    We intentionally avoid UC's shared cache so concurrent workers never race
-    on ``~/.local/share/undetected_chromedriver``.
-    """
+    if platform.machine() not in ("aarch64", "arm64", "armv8l"):
+        return
 
-    candidates = [
-        os.getenv("CHROMEDRIVER"),
-        shutil.which("chromedriver"),
-        "/usr/bin/chromedriver",
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        candidate_path = Path(candidate).expanduser()
-        if candidate_path.exists():
-            return candidate_path
-    raise RuntimeError(
-        "Chromedriver binary not found. Install chromedriver or set CHROMEDRIVER."
-    )
+    system_driver = Path("/usr/bin/chromedriver")
+    if not system_driver.exists():
+        return
+
+    local_driver = Path(_get_driver_exe_path()).expanduser()
+    local_driver.parent.mkdir(parents=True, exist_ok=True)
+
+    should_refresh = not local_driver.exists()
+    if not should_refresh:
+        try:
+            file_output = subprocess.check_output(
+                ["file", str(local_driver)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            should_refresh = "aarch64" not in file_output.lower()
+        except Exception:
+            should_refresh = True
+
+    if not should_refresh:
+        return
+
+    try:
+        shutil.copy2(system_driver, local_driver)
+        local_driver.chmod(0o755)
+        logger.info(f"Refreshed local UC driver cache from system chromedriver: {local_driver}")
+    except Exception as exp:
+        logger.warning(f"Failed to refresh local UC driver cache: {exp}")
 
 
-def _prepare_isolated_driver_executable() -> str | None:
-    """Create a per-run chromedriver copy so concurrent workers never share one binary."""
-    source_driver = _resolve_driver_source_executable()
-    runtime_driver_dir = PROJECT_ROOT / ".runtime" / "chromedriver_workers"
-    runtime_driver_dir.mkdir(parents=True, exist_ok=True)
-    isolated_driver = runtime_driver_dir / f"chromedriver-arm64-{os.getpid()}-{random.randint(1000, 9999)}"
-    shutil.copy2(source_driver, isolated_driver)
-    isolated_driver.chmod(0o755)
-    return str(isolated_driver)
+def _get_preferred_driver_executable_path(multi_procs_enabled: bool) -> str | None:
+    """Return a stable driver path, avoiding UC's broken x86 cache on ARM hosts."""
+
+    if platform.machine() in ("aarch64", "arm64", "armv8l"):
+        system_driver = Path("/usr/bin/chromedriver")
+        local_driver = PROJECT_ROOT / ".runtime" / "chromedriver-arm64"
+        if system_driver.exists():
+            try:
+                local_driver.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(system_driver, local_driver)
+                local_driver.chmod(0o755)
+                return str(local_driver)
+            except Exception as exp:
+                logger.warning(f"Failed to prepare ARM chromedriver copy: {exp}")
+    if multi_procs_enabled:
+        driver_exe_path = _get_driver_exe_path()
+        if Path(driver_exe_path).exists():
+            return driver_exe_path
+    return None
 
 
 def _has_usable_display(display_value: str | None) -> bool:
@@ -290,6 +488,140 @@ def _has_usable_display(display_value: str | None) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _get_display_dimensions(display_value: str | None) -> Optional[tuple[int, int]]:
+    if not _has_usable_display(display_value):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["xdpyinfo", "-display", display_value],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    match = re.search(r"dimensions:\s+(\d+)x(\d+)\s+pixels", result.stdout)
+    if not match:
+        return None
+
+    width = int(match.group(1))
+    height = int(match.group(2))
+    logger.debug(f"Detected active display dimensions: {width}x{height}")
+    return width, height
+
+
+@contextmanager
+def _uc_seed_lock():
+    UC_DRIVER_SEED_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(UC_DRIVER_SEED_LOCK_PATH, "a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _get_chromedriver_major_version(driver_path: Path) -> Optional[int]:
+    if not driver_path.exists():
+        return None
+
+    try:
+        version_output = subprocess.check_output(
+            [str(driver_path), "--version"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception as exp:
+        logger.debug(f"Failed to read ChromeDriver version from {driver_path}: {exp}")
+        return None
+
+    match = re.search(r"ChromeDriver\s+(\d+)\.", version_output)
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def _ensure_uc_seed_driver(browser_major_version: Optional[int]) -> Path:
+    """Ensure a patched shared UC seed driver exists for per-run isolated copies."""
+
+    system_driver = Path("/usr/bin/chromedriver")
+    if system_driver.exists():
+        return system_driver
+
+    shared_driver = Path(_get_driver_exe_path()).expanduser()
+    existing_major = _get_chromedriver_major_version(shared_driver)
+    if (
+        shared_driver.exists()
+        and (
+            browser_major_version is None
+            or existing_major is None
+            or existing_major == browser_major_version
+        )
+    ):
+        return shared_driver
+
+    with _uc_seed_lock():
+        existing_major = _get_chromedriver_major_version(shared_driver)
+        if (
+            shared_driver.exists()
+            and (
+                browser_major_version is None
+                or existing_major is None
+                or existing_major == browser_major_version
+            )
+        ):
+            return shared_driver
+
+        logger.info(
+            "Bootstrapping shared UC seed ChromeDriver for later isolated per-run copies: "
+            f"target_major={browser_major_version or 'auto'}"
+        )
+        patcher = undetected_chromedriver.patcher.Patcher(
+            version_main=browser_major_version or 0,
+            user_multi_procs=False,
+        )
+        patcher.auto()
+        seed_driver = Path(patcher.executable_path).expanduser()
+        seed_driver.chmod(0o755)
+        return seed_driver
+
+
+def _prepare_isolated_driver_executable(
+    browser_major_version: Optional[int],
+) -> tuple[str, Path]:
+    """Prepare a reserved ChromeDriver directory and executable for one browser run."""
+
+    seed_driver = _ensure_uc_seed_driver(browser_major_version)
+    driver_dir = reserve_unique_runtime_dir(
+        ISOLATED_CHROMEDRIVER_BASE_DIR,
+        prefix="driver_",
+        metadata={
+            "kind": "chromedriver_runtime",
+            "browser_major_version": browser_major_version,
+            "seed_driver": str(seed_driver),
+        },
+    )
+    driver_dir.mkdir(parents=True, exist_ok=True)
+
+    executable_name = seed_driver.name or "chromedriver"
+    isolated_driver_path = driver_dir / executable_name
+    shutil.copy2(seed_driver, isolated_driver_path)
+    isolated_driver_path.chmod(0o755)
+    logger.debug(
+        "Prepared isolated ChromeDriver copy for this browser run: "
+        f"seed={seed_driver}, isolated={isolated_driver_path}"
+    )
+    return str(isolated_driver_path), driver_dir
 
 
 class CustomChrome(undetected_chromedriver.Chrome):
@@ -347,13 +679,6 @@ class CustomChrome(undetected_chromedriver.Chrome):
         # this must come last, otherwise it will throw 'in use' errors
         self.patcher = None
 
-        runtime_driver_executable = getattr(self, "_runtime_driver_executable", None)
-        if runtime_driver_executable:
-            try:
-                Path(runtime_driver_executable).unlink(missing_ok=True)
-            except Exception:
-                pass
-
     def __del__(self):
         try:
             self.service.process.kill()
@@ -388,7 +713,12 @@ class CustomChrome(undetected_chromedriver.Chrome):
 
 
 def create_webdriver(
-    proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
+    proxy: str,
+    user_agent: Optional[str] = None,
+    plugin_folder_name: Optional[str] = None,
+    *,
+    city_name: Optional[str] = None,
+    rsw_id: Optional[str] = None,
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
     """Create Selenium Chrome webdriver instance
 
@@ -410,9 +740,25 @@ def create_webdriver(
 
     geolocation_db_client = GeolocationDB()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
-    headless_fallback = sys.platform.startswith("linux") and not has_display
+    prefer_headless = bool(getattr(config.webdriver, "prefer_headless", False))
+    headless_mode = sys.platform.startswith("linux") and (prefer_headless or not has_display)
+    display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
+    rotating_window_size = (
+        None
+        if config.webdriver.window_size
+        else _choose_rotating_window_size(display_dimensions)
+    )
+    startup_window_size: Optional[tuple[int, int]] = None
+    if config.webdriver.window_size:
+        width, height = config.webdriver.window_size.split(",")
+        startup_window_size = (int(width), int(height))
+    elif rotating_window_size:
+        startup_window_size = (int(rotating_window_size[0]), int(rotating_window_size[1]))
+    elif display_dimensions:
+        startup_window_size = (int(display_dimensions[0]), int(display_dimensions[1]))
 
-    chrome_options = undetected_chromedriver.ChromeOptions()
+    chrome_options = ChromeOptions()
+    chrome_options._suppress_uc_default_window_args = True
     chrome_prefs = {
         "webrtc.ip_handling_policy": "disable_non_proxied_udp",
         "webrtc.multiple_routes_enabled": False,
@@ -444,13 +790,25 @@ def create_webdriver(
     chrome_options.add_argument("--dns-prefetch-disable")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
-    if headless_fallback:
-        logger.warning(
-            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
-            "Falling back to headless Chrome."
-        )
+    if headless_mode:
+        fallback_width, fallback_height = startup_window_size or (1366, 768)
+        if prefer_headless and has_display:
+            logger.info(
+                "Running Chrome in configured headless mode on this VPS because "
+                "headless is currently outperforming headful mode."
+            )
+        else:
+            logger.warning(
+                f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+                "Falling back to headless Chrome."
+            )
         chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1366,768")
+        chrome_options.add_argument(f"--window-size={fallback_width},{fallback_height}")
+    elif startup_window_size:
+        chrome_options.add_argument(
+            f"--window-size={startup_window_size[0]},{startup_window_size[1]}"
+        )
+        chrome_options.add_argument("--window-position=0,0")
     if user_agent:
         chrome_options.add_argument(f"--user-agent={user_agent}")
 
@@ -473,130 +831,198 @@ def create_webdriver(
     if config.webdriver.incognito:
         chrome_options.add_argument("--incognito")
 
-    cleanup_result = cleanup_stale_uc_profiles(max_age_seconds=0)
-    if cleanup_result["removed_dirs"]:
-        freed_mb = cleanup_result["freed_bytes"] / (1024 * 1024)
-        logger.info(
-            "UC profile cleanup before browser startup: "
-            f"removed {cleanup_result['removed_dirs']} stale profile dir(s), "
-            f"freed ~{freed_mb:.1f} MiB."
-        )
-
-    base_dir = UC_PROFILE_BASE_DIR
-    base_dir.mkdir(exist_ok=True)
-    profile_dir = base_dir / f"profile_{random.randint(1000, 9999)}"
+    profile_runtime = _prepare_profile_runtime(
+        city_name=city_name,
+        rsw_id=rsw_id,
+        proxy=proxy,
+    )
+    profile_dir = Path(str(profile_runtime["profile_dir"]))
 
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
     chrome_options.add_argument("--profile-directory=Default")
 
     country_code = None
+    driver = None
+    runtime_driver_dir = None
 
-    isolated_driver_exe_path = _prepare_isolated_driver_executable()
-    driver_exe_path = isolated_driver_exe_path
+    try:
+        multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
+        multi_procs_enabled = multi_browser_flag_file.exists()
 
-    browser_binary_path = _get_browser_binary_path()
-    if proxy:
-        if config.webdriver.auth:
-            username, password, host, port = _parse_proxy_components(proxy)
-
-            masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
-            masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
-            masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
-
-            logger.info(f"Using proxy: {masked_proxy}")
-            logger.debug(f"Using proxy: {proxy}")
-            session_id = _extract_proxy_session_id(proxy)
-            if session_id:
-                logger.info(f"Proxy sticky session id: {session_id}")
-
-            install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
-            sleep(2 * config.behavior.wait_factor)
+        browser_binary_path = _get_browser_binary_path()
+        browser_major_version = get_browser_major_version()
+        if browser_major_version:
+            logger.debug(f"Detected browser major version: {browser_major_version}")
+        _ensure_local_uc_driver_cache()
+        if getattr(config.webdriver, "isolated_chromedriver_per_run", False):
+            driver_exe_path, runtime_driver_dir = _prepare_isolated_driver_executable(
+                browser_major_version
+            )
+            multi_procs_enabled = False
         else:
-            logger.info(f"Using proxy: {proxy}")
-            chrome_options.add_argument(f"--proxy-server={proxy}")
+            driver_exe_path = _get_preferred_driver_executable_path(multi_procs_enabled)
+        if proxy:
+            if config.webdriver.auth:
+                username, password, host, port = _parse_proxy_components(proxy)
 
-        # get location of the proxy IP
-        lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
-        if not country_code and getattr(config.webdriver, "identity_mode", "native_linux") == "native_linux":
-            inferred_country_code = _infer_country_code_from_proxy(proxy)
-            if inferred_country_code:
-                country_code = inferred_country_code
-                logger.info(
-                    "Identity mode 'native_linux' inferred country from proxy options: "
-                    f"{country_code}"
+                masked_username = (
+                    username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
                 )
-        if config.webdriver.language_from_proxy:
-            locale_code, accept_language = _resolve_proxy_locale(country_code)
-            if accept_language:
-                chrome_prefs["intl.accept_languages"] = accept_language
-            if locale_code:
-                chrome_options.add_argument(f"--lang={locale_code}")
+                masked_password = (
+                    password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
+                )
+                masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
 
-    chrome_options.add_experimental_option("prefs", chrome_prefs)
+                logger.info(f"Using proxy: {masked_proxy}")
+                logger.debug(f"Using proxy: {proxy}")
+                session_id = _extract_proxy_session_id(proxy)
+                if session_id:
+                    logger.info(f"Proxy sticky session id: {session_id}")
 
-    driver = CustomChrome(
-        browser_executable_path=browser_binary_path,
-        driver_executable_path=driver_exe_path,
-        options=chrome_options,
-        user_multi_procs=False,
-        use_subprocess=True,
-    )
-    driver._runtime_driver_executable = isolated_driver_exe_path
+                install_plugin(
+                    chrome_options,
+                    host,
+                    int(port),
+                    username,
+                    password,
+                    plugin_folder_name,
+                )
+                sleep(2 * config.behavior.wait_factor)
+            else:
+                logger.info(f"Using proxy: {proxy}")
+                chrome_options.add_argument(f"--proxy-server={proxy}")
 
-    if locale_code or accept_language:
-        _apply_browser_locale_overrides(driver, accept_language=accept_language)
+            # get location of the proxy IP
+            lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+            if (
+                not country_code
+                and getattr(config.webdriver, "identity_mode", "legacy") == "native_linux"
+            ):
+                inferred_country_code = _infer_country_code_from_proxy(proxy)
+                if inferred_country_code:
+                    country_code = inferred_country_code
+                    logger.info(
+                        "Identity mode 'native_linux' inferred country from proxy options: "
+                        f"{country_code}"
+                    )
+            if config.webdriver.language_from_proxy:
+                locale_code, accept_language = _resolve_proxy_locale(country_code)
+                if accept_language:
+                    chrome_prefs["intl.accept_languages"] = accept_language
+                if locale_code:
+                    chrome_options.add_argument(f"--lang={locale_code}")
 
-    if proxy:
-        accuracy = 95
+        chrome_options.add_experimental_option("prefs", chrome_prefs)
 
-        # set geolocation and timezone of the browser according to IP address
-        if lat and long:
-            driver.execute_cdp_cmd(
-                "Emulation.setGeolocationOverride",
-                {"latitude": lat, "longitude": long, "accuracy": accuracy},
+        driver = CustomChrome(
+            browser_executable_path=browser_binary_path,
+            driver_executable_path=driver_exe_path,
+            options=chrome_options,
+            headless=headless_mode,
+            version_main=browser_major_version,
+            user_multi_procs=multi_procs_enabled,
+            use_subprocess=True,
+        )
+        driver._active_proxy = proxy if proxy else None
+        driver._active_user_agent = user_agent
+
+        if proxy:
+            accuracy = 95
+
+            # set geolocation and timezone of the browser according to IP address
+            if lat and long:
+                driver.execute_cdp_cmd(
+                    "Emulation.setGeolocationOverride",
+                    {"latitude": lat, "longitude": long, "accuracy": accuracy},
+                )
+
+                if not timezone:
+                    response = requests.get(
+                        f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}"
+                    )
+
+                    if response.status_code == 200:
+                        timezone = response.json()["tz_name"]
+
+                driver._custom_timezone = timezone
+
+                driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+
+                try:
+                    timezone_proxy_label = parse_proxy_value(proxy).host_port
+                except Exception:
+                    timezone_proxy_label = proxy
+                logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
+
+        if locale_code or accept_language:
+            _apply_browser_locale_overrides(
+                driver,
+                locale_code=locale_code,
+                accept_language=accept_language,
+                user_agent=user_agent,
             )
 
-            if not timezone:
-                response = requests.get(f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}")
+        driver._runtime_profile_dir = str(profile_dir)
+        driver._runtime_profile_persistent = bool(profile_runtime["persistent"])
+        driver._profile_key = profile_runtime["profile_key"]
+        driver._profile_ttl_minutes = int(profile_runtime["ttl_minutes"])
+        driver._profile_current_proxy_ip = profile_runtime["current_proxy_ip"]
+        driver._profile_current_proxy_session_id = profile_runtime["current_proxy_session_id"]
+        driver._profile_between_run_ip_changed = bool(profile_runtime["between_run_ip_changed"])
+        driver._profile_seed_required = bool(profile_runtime["seed_required"])
+        driver._profile_cleanup_policy = str(profile_runtime["cleanup_policy"])
+        driver._profile_city_name = city_name
+        driver._profile_rsw_id = str(rsw_id) if rsw_id is not None else None
+        driver._profile_locale_code = locale_code
+        driver._profile_country_code = country_code
+        driver._profile_start_url = getattr(driver, "current_url", None)
+        driver._runtime_driver_dir = str(runtime_driver_dir) if runtime_driver_dir else None
 
-                if response.status_code == 200:
-                    timezone = response.json()["tz_name"]
+        if headless_mode:
+            logger.debug("Skipping window maximize/position because Chrome is running headless.")
+        elif startup_window_size:
+            width, height = startup_window_size
+            logger.debug(f"Setting startup-aligned window size as {width}x{height} px")
+            driver.set_window_size(width, height)
+        else:
+            logger.debug("Maximizing window...")
+            driver.maximize_window()
 
-            driver._custom_timezone = timezone
+        if config.webdriver.shift_windows and not headless_mode:
+            width, height = (
+                config.webdriver.window_size.split(",")
+                if config.webdriver.window_size
+                else (None, None)
+            )
+            _shift_window_position(driver, width, height)
 
-            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
+        return (driver, country_code) if config.webdriver.country_domain else (driver, None)
+    except BaseException:
+        if driver:
             try:
-                timezone_proxy_label = parse_proxy_value(proxy).host_port
-            except Exception:
-                timezone_proxy_label = proxy
-            logger.debug(f"Timezone of {timezone_proxy_label}: {timezone}")
-        driver._active_proxy = proxy
+                driver.quit()
+            except Exception as close_exp:
+                logger.debug(f"Failed to close browser after startup exception: {close_exp}")
 
-    else:
-        driver._active_proxy = None
+        if release_runtime_dir(profile_dir) and not bool(profile_runtime["persistent"]):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        if runtime_driver_dir and release_runtime_dir(runtime_driver_dir):
+            shutil.rmtree(runtime_driver_dir, ignore_errors=True)
+        raise
 
-    driver._runtime_profile_dir = profile_dir
 
-    if headless_fallback:
-        logger.debug("Skipping window maximize/position because Chrome is running headless.")
-    elif config.webdriver.window_size:
-        width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
-        driver.set_window_size(width, height)
-    else:
-        logger.debug("Maximizing window...")
-        driver.maximize_window()
+class ChromeOptions(undetected_chromedriver.ChromeOptions):
+    """Chrome options wrapper that suppresses UC's hardcoded oversized startup window flags."""
 
-    if config.webdriver.shift_windows and not headless_fallback:
-        width, height = (
-            config.webdriver.window_size.split(",")
-            if config.webdriver.window_size
-            else (None, None)
-        )
-        _shift_window_position(driver, width, height)
+    def add_argument(self, argument):
+        if (
+            getattr(self, "_suppress_uc_default_window_args", False)
+            and argument in UC_DEFAULT_WINDOW_ARGS
+        ):
+            logger.debug(f"Suppressing undetected_chromedriver default argument: {argument}")
+            return
 
-    return (driver, country_code) if config.webdriver.country_domain else (driver, None)
+        return super().add_argument(argument)
 
 
 def create_seleniumbase_driver(
@@ -617,7 +1043,22 @@ def create_seleniumbase_driver(
     browser_binary_path = _get_browser_binary_path()
     _ensure_seleniumbase_uses_system_chromedriver()
     has_display = _has_usable_display(os.environ.get("DISPLAY"))
-    headless_fallback = sys.platform.startswith("linux") and not has_display
+    prefer_headless = bool(getattr(config.webdriver, "prefer_headless", False))
+    headless_mode = sys.platform.startswith("linux") and (prefer_headless or not has_display)
+    display_dimensions = _get_display_dimensions(os.environ.get("DISPLAY")) if has_display else None
+    rotating_window_size = (
+        None
+        if config.webdriver.window_size
+        else _choose_rotating_window_size(display_dimensions)
+    )
+    startup_window_size: Optional[tuple[int, int]] = None
+    if config.webdriver.window_size:
+        width, height = config.webdriver.window_size.split(",")
+        startup_window_size = (int(width), int(height))
+    elif rotating_window_size:
+        startup_window_size = (int(rotating_window_size[0]), int(rotating_window_size[1]))
+    elif display_dimensions:
+        startup_window_size = (int(display_dimensions[0]), int(display_dimensions[1]))
 
     country_code = None
     locale_code = None
@@ -648,7 +1089,7 @@ def create_seleniumbase_driver(
     driver = seleniumbase.get_driver(
         browser_name="chrome",
         undetectable=False,
-        headless2=headless_fallback,
+        headless2=headless_mode,
         do_not_track=True,
         user_agent=user_agent,
         proxy_string=proxy or None,
@@ -661,7 +1102,12 @@ def create_seleniumbase_driver(
     )
 
     if locale_code or accept_language:
-        _apply_browser_locale_overrides(driver, accept_language=accept_language)
+        _apply_browser_locale_overrides(
+            driver,
+            locale_code=locale_code,
+            accept_language=accept_language,
+            user_agent=user_agent,
+        )
 
     # set geolocation and timezone if available
     if proxy and lat and long:
@@ -688,23 +1134,30 @@ def create_seleniumbase_driver(
         except Exception as exp:
             logger.debug(f"Skipping SeleniumBase CDP geo/timezone override: {exp}")
     driver._active_proxy = proxy if proxy else None
+    driver._active_user_agent = user_agent
 
     # handle window size and position
-    if headless_fallback:
-        logger.warning(
-            f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
-            "Falling back to headless SeleniumBase Chrome."
-        )
+    if headless_mode:
+        if prefer_headless and has_display:
+            logger.info(
+                "Running SeleniumBase Chrome in configured headless mode on this VPS because "
+                "headless is currently outperforming headful mode."
+            )
+        else:
+            logger.warning(
+                f"No usable X display found for DISPLAY={os.environ.get('DISPLAY')!r}. "
+                "Falling back to headless SeleniumBase Chrome."
+            )
         logger.debug("Skipping window maximize/position because SeleniumBase Chrome is headless.")
-    elif config.webdriver.window_size:
-        width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
+    elif startup_window_size:
+        width, height = startup_window_size
+        logger.debug(f"Setting startup-aligned window size as {width}x{height} px")
         driver.set_window_size(int(width), int(height))
     else:
         logger.debug("Maximizing window...")
         driver.maximize_window()
 
-    if config.webdriver.shift_windows and not headless_fallback:
+    if config.webdriver.shift_windows and not headless_mode:
         width, height = (
             config.webdriver.window_size.split(",")
             if config.webdriver.window_size
@@ -760,12 +1213,48 @@ def _shift_window_position(
     sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
 
 
+def _get_driver_exe_path() -> str:
+    """Get the path for the chromedriver executable to avoid downloading and patching each time
+
+    :rtype: str
+    :returns: Absoulute path of the chromedriver executable
+    """
+
+    platform = sys.platform
+    prefix = "undetected"
+    exe_name = "chromedriver%s"
+
+    if platform.endswith("win32"):
+        exe_name %= ".exe"
+    if platform.endswith(("linux", "linux2")):
+        exe_name %= ""
+    if platform.endswith("darwin"):
+        exe_name %= ""
+
+    if platform.endswith("win32"):
+        dirpath = "~/appdata/roaming/undetected_chromedriver"
+    elif "LAMBDA_TASK_ROOT" in os.environ:
+        dirpath = "/tmp/undetected_chromedriver"
+    elif platform.startswith(("linux", "linux2")):
+        dirpath = "~/.local/share/undetected_chromedriver"
+    elif platform.endswith("darwin"):
+        dirpath = "~/Library/Application Support/undetected_chromedriver"
+    else:
+        dirpath = "~/.undetected_chromedriver"
+
+    driver_exe_folder = os.path.abspath(os.path.expanduser(dirpath))
+    driver_exe_path = os.path.join(driver_exe_folder, "_".join([prefix, exe_name]))
+
+    return driver_exe_path
+
+
 def _apply_timezone_consistency_script(
     driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver],
 ) -> None:
-    """Keep timezone JS surfaces aligned with the CDP timezone override."""
+    """Inject only the timezone consistency patches needed before Google loads."""
 
     timezone = getattr(driver, "_custom_timezone", None)
+
     if not timezone:
         return
 

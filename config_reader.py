@@ -21,13 +21,24 @@ class WebdriverParams:
     proxy: str
     auth: Optional[bool] = False
     incognito: Optional[bool] = False
-    identity_mode: Optional[str] = "native_linux"
+    identity_mode: Optional[str] = "legacy"
     country_domain: Optional[bool] = False
     language_from_proxy: Optional[bool] = False
     ss_on_exception: Optional[bool] = False
     window_size: Optional[str] = ""
     shift_windows: Optional[bool] = False
+    prefer_headless: Optional[bool] = False
+    isolated_chromedriver_per_run: Optional[bool] = False
     use_seleniumbase: Optional[bool] = False
+    profile_reuse_enabled: Optional[bool] = False
+    profile_reuse_key: Optional[str] = "city"
+    profile_reuse_ttl_minutes: Optional[int] = 45
+    profile_seed_google_consent: Optional[bool] = False
+    profile_preserve_consent_cookies: Optional[bool] = True
+    profile_preserve_locale_cookies: Optional[bool] = True
+    profile_soft_cleanup_on_ip_change: Optional[bool] = True
+    profile_recycle_on_mid_session_ip_change: Optional[bool] = True
+    profile_risk_score_threshold: Optional[int] = 6
 
 
 @dataclass
@@ -97,13 +108,40 @@ class ConfigReader:
             proxy=config["webdriver"]["proxy"],
             auth=config["webdriver"]["auth"],
             incognito=config["webdriver"]["incognito"],
-            identity_mode=config["webdriver"].get("identity_mode", "native_linux"),
+            identity_mode=config["webdriver"].get("identity_mode", "legacy"),
             country_domain=config["webdriver"]["country_domain"],
             language_from_proxy=config["webdriver"]["language_from_proxy"],
             ss_on_exception=config["webdriver"]["ss_on_exception"],
             window_size=config["webdriver"]["window_size"],
             shift_windows=config["webdriver"]["shift_windows"],
+            prefer_headless=config["webdriver"].get("prefer_headless", False),
+            isolated_chromedriver_per_run=config["webdriver"].get(
+                "isolated_chromedriver_per_run", False
+            ),
             use_seleniumbase=config["webdriver"]["use_seleniumbase"],
+            profile_reuse_enabled=config["webdriver"].get("profile_reuse_enabled", False),
+            profile_reuse_key=config["webdriver"].get("profile_reuse_key", "city"),
+            profile_reuse_ttl_minutes=config["webdriver"].get(
+                "profile_reuse_ttl_minutes", 45
+            ),
+            profile_seed_google_consent=config["webdriver"].get(
+                "profile_seed_google_consent", False
+            ),
+            profile_preserve_consent_cookies=config["webdriver"].get(
+                "profile_preserve_consent_cookies", True
+            ),
+            profile_preserve_locale_cookies=config["webdriver"].get(
+                "profile_preserve_locale_cookies", True
+            ),
+            profile_soft_cleanup_on_ip_change=config["webdriver"].get(
+                "profile_soft_cleanup_on_ip_change", True
+            ),
+            profile_recycle_on_mid_session_ip_change=config["webdriver"].get(
+                "profile_recycle_on_mid_session_ip_change", True
+            ),
+            profile_risk_score_threshold=config["webdriver"].get(
+                "profile_risk_score_threshold", 6
+            ),
         )
 
         if self.paths.query_file and config["behavior"]["query"]:

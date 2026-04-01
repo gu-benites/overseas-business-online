@@ -15,7 +15,16 @@
         "ss_on_exception": false,
         "window_size": "",
         "shift_windows": false,
-        "use_seleniumbase": false
+        "use_seleniumbase": false,
+        "profile_reuse_enabled": true,
+        "profile_reuse_key": "city",
+        "profile_reuse_ttl_minutes": 45,
+        "profile_seed_google_consent": true,
+        "profile_preserve_consent_cookies": true,
+        "profile_preserve_locale_cookies": true,
+        "profile_soft_cleanup_on_ip_change": true,
+        "profile_recycle_on_mid_session_ip_change": true,
+        "profile_risk_score_threshold": 6
     },
     "behavior": {
         "query": "",
