@@ -30,6 +30,15 @@ class WebdriverParams:
     prefer_headless: Optional[bool] = False
     isolated_chromedriver_per_run: Optional[bool] = False
     use_seleniumbase: Optional[bool] = False
+    profile_reuse_enabled: Optional[bool] = False
+    profile_reuse_key: Optional[str] = "city"
+    profile_reuse_ttl_minutes: Optional[int] = 45
+    profile_seed_google_consent: Optional[bool] = False
+    profile_preserve_consent_cookies: Optional[bool] = True
+    profile_preserve_locale_cookies: Optional[bool] = True
+    profile_soft_cleanup_on_ip_change: Optional[bool] = True
+    profile_recycle_on_mid_session_ip_change: Optional[bool] = True
+    profile_risk_score_threshold: Optional[int] = 6
 
 
 @dataclass
@@ -110,6 +119,29 @@ class ConfigReader:
                 "isolated_chromedriver_per_run", False
             ),
             use_seleniumbase=config["webdriver"]["use_seleniumbase"],
+            profile_reuse_enabled=config["webdriver"].get("profile_reuse_enabled", False),
+            profile_reuse_key=config["webdriver"].get("profile_reuse_key", "city"),
+            profile_reuse_ttl_minutes=config["webdriver"].get(
+                "profile_reuse_ttl_minutes", 45
+            ),
+            profile_seed_google_consent=config["webdriver"].get(
+                "profile_seed_google_consent", False
+            ),
+            profile_preserve_consent_cookies=config["webdriver"].get(
+                "profile_preserve_consent_cookies", True
+            ),
+            profile_preserve_locale_cookies=config["webdriver"].get(
+                "profile_preserve_locale_cookies", True
+            ),
+            profile_soft_cleanup_on_ip_change=config["webdriver"].get(
+                "profile_soft_cleanup_on_ip_change", True
+            ),
+            profile_recycle_on_mid_session_ip_change=config["webdriver"].get(
+                "profile_recycle_on_mid_session_ip_change", True
+            ),
+            profile_risk_score_threshold=config["webdriver"].get(
+                "profile_risk_score_threshold", 6
+            ),
         )
 
         if self.paths.query_file and config["behavior"]["query"]:

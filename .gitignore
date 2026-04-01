@@ -147,6 +147,7 @@ artifacts/screenshots/
 google-page.png
 .tmp_uc_profiles/
 core.*
+.runtime/
 
 .MULTI_BROWSERS_IN_USE
 .TELEGRAM_CHAT_ID

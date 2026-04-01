@@ -32,10 +32,13 @@ from adb import adb_controller
 from clicklogs_db import ClickLogsDB
 from config_reader import config
 from logger import logger
+from profile_state_db import ProfileStateDB
 from stats import SearchStats
 from utils import (
     Direction,
     add_cookies,
+    add_seed_cookies,
+    build_google_seed_cookies,
     domain_matches_url,
     get_ad_allowlist_domains,
     get_ad_denylist_domains,
@@ -270,6 +273,15 @@ class SearchController:
             self._set_start_url(country_code)
 
         self._clicklogs_db_client = ClickLogsDB()
+        self._profile_state_db = ProfileStateDB()
+        self._profile_key = getattr(self._driver, "_profile_key", None)
+        self._profile_cleanup_policy = getattr(self._driver, "_profile_cleanup_policy", "ephemeral")
+        self._profile_between_run_ip_changed = bool(
+            getattr(self._driver, "_profile_between_run_ip_changed", False)
+        )
+        self._profile_seed_required = bool(getattr(self._driver, "_profile_seed_required", False))
+        self._profile_ttl_minutes = int(getattr(self._driver, "_profile_ttl_minutes", 45) or 45)
+        self._profile_preserve_cookie_names = self._build_preserved_cookie_name_set()
 
         self._load()
 
@@ -1153,6 +1165,7 @@ class SearchController:
 
         if self._driver:
             try:
+                self._update_profile_state_from_run()
                 self._delete_cache_and_cookies()
                 self._driver.quit()
 
@@ -1169,6 +1182,190 @@ class SearchController:
             self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
         else:
             self._driver.get(self.URL)
+        self._apply_profile_startup_bootstrap()
+
+    def _build_preserved_cookie_name_set(self) -> set[str]:
+        names: set[str] = set()
+        if bool(getattr(config.webdriver, "profile_preserve_consent_cookies", True)):
+            names.update({"CONSENT", "SOCS"})
+        if bool(getattr(config.webdriver, "profile_preserve_locale_cookies", True)):
+            names.add("PREF")
+        return names
+
+    def _is_google_url(self, url: str) -> bool:
+        try:
+            host = urllib.parse.urlparse(url).netloc.lower()
+        except Exception:
+            return False
+        return "google." in host
+
+    def _open_google_surface_for_profile_ops(self) -> None:
+        try:
+            current_url = self._driver.current_url or ""
+        except Exception:
+            current_url = ""
+
+        if self._is_google_url(current_url):
+            return
+
+        if config.webdriver.use_seleniumbase:
+            self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
+        else:
+            self._driver.get(self.URL)
+        self._wait_for_page_settle(timeout=4)
+
+    def _apply_profile_startup_bootstrap(self) -> None:
+        if not self._profile_key:
+            return
+
+        changed_state = False
+        self._open_google_surface_for_profile_ops()
+
+        if (
+            self._profile_between_run_ip_changed
+            and bool(getattr(config.webdriver, "profile_soft_cleanup_on_ip_change", True))
+        ):
+            changed_state = self._apply_between_run_ip_change_hygiene() or changed_state
+
+        if (
+            self._profile_seed_required
+            and bool(getattr(config.webdriver, "profile_seed_google_consent", False))
+        ):
+            changed_state = self._apply_seed_cookies_for_cold_profile() or changed_state
+
+        if changed_state:
+            self._driver.refresh()
+            self._wait_for_page_settle(timeout=4)
+
+    def _apply_between_run_ip_change_hygiene(self) -> bool:
+        self._open_google_surface_for_profile_ops()
+        deleted_count = 0
+
+        try:
+            cookies = self._driver.get_cookies()
+        except Exception as exp:
+            logger.debug(f"Failed to inspect Google cookies for IP-change hygiene: {exp}")
+            return False
+
+        for cookie in cookies:
+            cookie_name = str(cookie.get("name") or "").strip()
+            if cookie_name in self._profile_preserve_cookie_names:
+                continue
+            try:
+                self._driver.delete_cookie(cookie_name)
+                deleted_count += 1
+            except Exception as exp:
+                logger.debug(f"Failed to delete cookie '{cookie_name}' during hygiene: {exp}")
+
+        try:
+            self._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+        except Exception as exp:
+            logger.debug(f"Failed to clear browser cache during IP-change hygiene: {exp}")
+
+        for script in (
+            "window.sessionStorage.clear();",
+            "window.localStorage.clear();",
+        ):
+            try:
+                self._driver.execute_script(script)
+            except Exception as exp:
+                logger.debug(f"Failed to execute startup storage hygiene script: {exp}")
+
+        logger.info(
+            "Applied between-run IP-change hygiene for profile '%s': deleted %d Google cookie(s), "
+            "preserved %d cookie name(s).",
+            self._profile_key,
+            deleted_count,
+            len(self._profile_preserve_cookie_names),
+        )
+        return True
+
+    def _apply_seed_cookies_for_cold_profile(self) -> bool:
+        locale_code = getattr(self._driver, "_profile_locale_code", None)
+        country_code = getattr(self._driver, "_profile_country_code", None)
+        domain_hint = urllib.parse.urlparse(self.URL).netloc or ".google.com"
+        cookies = build_google_seed_cookies(
+            locale_code=locale_code,
+            country_code=country_code,
+            domain_hint=domain_hint,
+            include_consent=bool(getattr(config.webdriver, "profile_seed_google_consent", False)),
+        )
+        added_count = add_seed_cookies(self._driver, cookies)
+        if added_count and self._profile_key:
+            self._profile_state_db.mark_seeded(self._profile_key)
+            logger.info(
+                "Applied %d Google seed cookie(s) to cold profile '%s'.",
+                added_count,
+                self._profile_key,
+            )
+            return True
+        return False
+
+    def _update_profile_state_from_run(self) -> None:
+        if not self._profile_key:
+            return
+
+        current_proxy_ip = (
+            self._stats.latest_proxy_ip
+            or self._stats.initial_proxy_ip
+            or getattr(self._driver, "_profile_current_proxy_ip", None)
+        )
+        current_proxy_session_id = getattr(self._driver, "_profile_current_proxy_session_id", None)
+        self._profile_state_db.record_proxy_observation(
+            self._profile_key,
+            proxy_ip=current_proxy_ip,
+            proxy_session_id=current_proxy_session_id,
+            ttl_minutes=self._profile_ttl_minutes,
+        )
+
+        risk_delta = 0
+        recycle_reason = None
+        if self._stats.ip_changed_mid_session:
+            risk_delta += 4
+            recycle_reason = "mid_session_ip_change"
+        elif self._stats.google_blocked_after_captcha:
+            risk_delta += 3
+            recycle_reason = "google_block_after_captcha"
+        elif self._stats.captcha_seen and not self._stats.captcha_accepted:
+            risk_delta += 2
+            recycle_reason = "captcha_not_accepted"
+        elif self._stats.captcha_seen:
+            risk_delta += 1
+        elif self._stats.ads_clicked or self._stats.shopping_ads_clicked:
+            risk_delta -= 1
+        else:
+            risk_delta = 0
+
+        next_risk_score = self._profile_state_db.adjust_risk(
+            self._profile_key,
+            risk_delta,
+            reason=recycle_reason,
+        )
+
+        should_recycle = False
+        if (
+            self._stats.ip_changed_mid_session
+            and bool(getattr(config.webdriver, "profile_recycle_on_mid_session_ip_change", True))
+        ):
+            should_recycle = True
+            recycle_reason = recycle_reason or "mid_session_ip_change"
+        elif next_risk_score >= int(getattr(config.webdriver, "profile_risk_score_threshold", 6) or 6):
+            should_recycle = True
+            recycle_reason = recycle_reason or "risk_threshold"
+
+        if should_recycle:
+            self._profile_state_db.mark_recycle(self._profile_key, recycle_reason or "recycle")
+            self._driver._runtime_profile_recycle = True
+            self._driver._profile_cleanup_policy = "city_profile_recycle"
+            self._profile_cleanup_policy = "city_profile_recycle"
+            logger.warning(
+                "Marked reusable profile '%s' for recycle: reason=%s, risk_score=%s",
+                self._profile_key,
+                recycle_reason,
+                next_risk_score,
+            )
+        else:
+            self._driver._runtime_profile_recycle = False
 
     def _get_shopping_ad_links(self) -> AdList:
         """Extract shopping ad links to click if exists
@@ -1794,15 +1991,38 @@ class SearchController:
     def _delete_cache_and_cookies(self) -> None:
         """Delete browser cache, storage, and cookies"""
 
-        logger.debug("Deleting browser cache and cookies...")
+        logger.debug(f"Applying browser cleanup policy: {self._profile_cleanup_policy}")
 
         try:
-            self._driver.delete_all_cookies()
+            if self._profile_cleanup_policy in ("ephemeral", "city_profile_recycle"):
+                self._driver.delete_all_cookies()
+                self._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+                self._driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+                self._driver.execute_script("window.localStorage.clear();")
+                self._driver.execute_script("window.sessionStorage.clear();")
+                return
 
-            self._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
-            self._driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
-            self._driver.execute_script("window.localStorage.clear();")
-            self._driver.execute_script("window.sessionStorage.clear();")
+            if self._profile_cleanup_policy == "city_profile_ip_changed_cleanup":
+                self._open_google_surface_for_profile_ops()
+                for cookie in self._driver.get_cookies():
+                    cookie_name = str(cookie.get("name") or "").strip()
+                    if cookie_name in self._profile_preserve_cookie_names:
+                        continue
+                    try:
+                        self._driver.delete_cookie(cookie_name)
+                    except Exception as exp:
+                        logger.debug(
+                            f"Failed to delete cookie '{cookie_name}' during profile cleanup: {exp}"
+                        )
+                self._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+                self._driver.execute_script("window.localStorage.clear();")
+                self._driver.execute_script("window.sessionStorage.clear();")
+                return
+
+            if self._profile_cleanup_policy == "city_profile_soft_cleanup":
+                self._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+                self._driver.execute_script("window.sessionStorage.clear();")
+                return
 
         except Exception as exp:
             if "not connected to DevTools" in str(exp):

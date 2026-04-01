@@ -49,21 +49,30 @@ else:
 
 from config_reader import config
 from browser_cleanup import (
+    CITY_PROFILE_BASE_DIR,
     ISOLATED_CHROMEDRIVER_BASE_DIR,
     UC_PROFILE_BASE_DIR,
     cleanup_stale_uc_profiles,
     release_runtime_dir,
+    reserve_runtime_dir,
     reserve_unique_runtime_dir,
 )
 from geolocation_db import GeolocationDB
 from logger import logger
+from profile_state_db import ProfileStateDB, build_profile_key
 from proxy import (
     apply_iproyal_sticky_session,
     extract_proxy_session_id,
     install_plugin,
     parse_proxy_value,
 )
-from utils import get_browser_major_version, get_location, get_locale_language, get_random_sleep
+from utils import (
+    get_browser_major_version,
+    get_location,
+    get_locale_language,
+    get_proxy_exit_ip,
+    get_random_sleep,
+)
 
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
@@ -225,6 +234,108 @@ def _infer_country_code_from_proxy(proxy: str) -> Optional[str]:
             except Exception:
                 return None
     return None
+
+
+def _prepare_profile_runtime(
+    *,
+    city_name: Optional[str],
+    rsw_id: Optional[str],
+    proxy: Optional[str],
+) -> dict[str, object]:
+    """Resolve either a reusable city profile or a per-run ephemeral profile."""
+
+    cleanup_result = cleanup_stale_uc_profiles(max_age_seconds=0)
+    if cleanup_result["removed_dirs"]:
+        freed_mb = cleanup_result["freed_bytes"] / (1024 * 1024)
+        logger.info(
+            "UC profile cleanup before browser startup: "
+            f"removed {cleanup_result['removed_dirs']} stale profile dir(s), "
+            f"freed ~{freed_mb:.1f} MiB."
+        )
+    profile_state_db = ProfileStateDB()
+    profile_state_db.cleanup_expired_or_recycled_profiles()
+
+    reuse_enabled = bool(getattr(config.webdriver, "profile_reuse_enabled", False))
+    reuse_key_mode = str(getattr(config.webdriver, "profile_reuse_key", "city") or "city")
+    ttl_minutes = max(1, int(getattr(config.webdriver, "profile_reuse_ttl_minutes", 45) or 45))
+    current_proxy_ip = get_proxy_exit_ip(proxy, max_retries=1, retry_sleep_seconds=1) if proxy else None
+    current_proxy_session_id = _extract_proxy_session_id(proxy) if proxy else None
+
+    if reuse_enabled and city_name:
+        profile_key = build_profile_key(city_name, reuse_key_mode)
+        state = profile_state_db.ensure_profile(
+            profile_key=profile_key,
+            city_name=city_name,
+            rsw_id=rsw_id,
+            ttl_minutes=ttl_minutes,
+        )
+        profile_dir = Path(state.profile_dir)
+        profile_dir.parent.mkdir(parents=True, exist_ok=True)
+        between_run_ip_changed = bool(
+            current_proxy_ip and state.last_proxy_ip and current_proxy_ip != state.last_proxy_ip
+        )
+        seed_required = not profile_dir.exists() or state.last_seeded_at is None
+        recycle_pending = state.status == "recycle_pending"
+
+        if recycle_pending and profile_dir.exists():
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            profile_state_db.reset_profile(profile_key)
+            seed_required = True
+            between_run_ip_changed = False
+
+        try:
+            reserve_runtime_dir(
+                profile_dir,
+                metadata={
+                    "kind": "city_profile",
+                    "profile_key": profile_key,
+                    "city_name": city_name,
+                },
+            )
+        except RuntimeError:
+            logger.warning(
+                "Reusable city profile '%s' is already in use by another live process. "
+                "Falling back to an ephemeral profile for this run.",
+                profile_key,
+            )
+        else:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "profile_dir": profile_dir,
+                "persistent": True,
+                "profile_key": profile_key,
+                "profile_state_db": profile_state_db,
+                "ttl_minutes": ttl_minutes,
+                "current_proxy_ip": current_proxy_ip,
+                "current_proxy_session_id": current_proxy_session_id,
+                "between_run_ip_changed": between_run_ip_changed,
+                "seed_required": seed_required,
+                "cleanup_policy": (
+                    "city_profile_ip_changed_cleanup"
+                    if between_run_ip_changed
+                    and bool(getattr(config.webdriver, "profile_soft_cleanup_on_ip_change", True))
+                    else "city_profile_soft_cleanup"
+                ),
+            }
+
+    profile_dir = reserve_unique_runtime_dir(
+        UC_PROFILE_BASE_DIR,
+        prefix="profile_",
+        metadata={"kind": "uc_profile"},
+    )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "profile_dir": profile_dir,
+        "persistent": False,
+        "profile_key": None,
+        "profile_state_db": profile_state_db,
+        "ttl_minutes": ttl_minutes,
+        "current_proxy_ip": current_proxy_ip,
+        "current_proxy_session_id": current_proxy_session_id,
+        "between_run_ip_changed": False,
+        "seed_required": False,
+        "cleanup_policy": "ephemeral",
+    }
 
 
 def _ensure_seleniumbase_uses_system_chromedriver() -> None:
@@ -602,7 +713,12 @@ class CustomChrome(undetected_chromedriver.Chrome):
 
 
 def create_webdriver(
-    proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
+    proxy: str,
+    user_agent: Optional[str] = None,
+    plugin_folder_name: Optional[str] = None,
+    *,
+    city_name: Optional[str] = None,
+    rsw_id: Optional[str] = None,
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
     """Create Selenium Chrome webdriver instance
 
@@ -715,21 +831,12 @@ def create_webdriver(
     if config.webdriver.incognito:
         chrome_options.add_argument("--incognito")
 
-    cleanup_result = cleanup_stale_uc_profiles(max_age_seconds=0)
-    if cleanup_result["removed_dirs"]:
-        freed_mb = cleanup_result["freed_bytes"] / (1024 * 1024)
-        logger.info(
-            "UC profile cleanup before browser startup: "
-            f"removed {cleanup_result['removed_dirs']} stale profile dir(s), "
-            f"freed ~{freed_mb:.1f} MiB."
-        )
-
-    profile_dir = reserve_unique_runtime_dir(
-        UC_PROFILE_BASE_DIR,
-        prefix="profile_",
-        metadata={"kind": "uc_profile"},
+    profile_runtime = _prepare_profile_runtime(
+        city_name=city_name,
+        rsw_id=rsw_id,
+        proxy=proxy,
     )
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = Path(str(profile_runtime["profile_dir"]))
 
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
     chrome_options.add_argument("--profile-directory=Default")
@@ -856,6 +963,19 @@ def create_webdriver(
             )
 
         driver._runtime_profile_dir = str(profile_dir)
+        driver._runtime_profile_persistent = bool(profile_runtime["persistent"])
+        driver._profile_key = profile_runtime["profile_key"]
+        driver._profile_ttl_minutes = int(profile_runtime["ttl_minutes"])
+        driver._profile_current_proxy_ip = profile_runtime["current_proxy_ip"]
+        driver._profile_current_proxy_session_id = profile_runtime["current_proxy_session_id"]
+        driver._profile_between_run_ip_changed = bool(profile_runtime["between_run_ip_changed"])
+        driver._profile_seed_required = bool(profile_runtime["seed_required"])
+        driver._profile_cleanup_policy = str(profile_runtime["cleanup_policy"])
+        driver._profile_city_name = city_name
+        driver._profile_rsw_id = str(rsw_id) if rsw_id is not None else None
+        driver._profile_locale_code = locale_code
+        driver._profile_country_code = country_code
+        driver._profile_start_url = getattr(driver, "current_url", None)
         driver._runtime_driver_dir = str(runtime_driver_dir) if runtime_driver_dir else None
 
         if headless_mode:
@@ -884,7 +1004,7 @@ def create_webdriver(
             except Exception as close_exp:
                 logger.debug(f"Failed to close browser after startup exception: {close_exp}")
 
-        if release_runtime_dir(profile_dir):
+        if release_runtime_dir(profile_dir) and not bool(profile_runtime["persistent"]):
             shutil.rmtree(profile_dir, ignore_errors=True)
         if runtime_driver_dir and release_runtime_dir(runtime_driver_dir):
             shutil.rmtree(runtime_driver_dir, ignore_errors=True)

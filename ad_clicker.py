@@ -59,6 +59,33 @@ def _cleanup_reserved_runtime_dir(path: str | Path | None) -> None:
         logger.debug(f"Failed to cleanup runtime dir '{runtime_dir}': {exp}")
 
 
+def _release_reserved_runtime_dir(path: str | Path | None) -> None:
+    if not path:
+        return
+
+    runtime_dir = Path(path)
+    try:
+        release_runtime_dir(runtime_dir)
+    except Exception as exp:
+        logger.debug(f"Failed to release runtime dir reservation '{runtime_dir}': {exp}")
+
+
+def _cleanup_driver_runtime(driver, *, delete_persistent_profile: bool = False) -> None:
+    if not driver:
+        return
+
+    profile_dir = getattr(driver, "_runtime_profile_dir", None)
+    if profile_dir:
+        persistent_profile = bool(getattr(driver, "_runtime_profile_persistent", False))
+        if persistent_profile and not delete_persistent_profile:
+            _release_reserved_runtime_dir(profile_dir)
+        else:
+            _cleanup_reserved_runtime_dir(profile_dir)
+
+    runtime_driver_dir = getattr(driver, "_runtime_driver_dir", None)
+    _cleanup_reserved_runtime_dir(runtime_driver_dir)
+
+
 def _get_next_query(current_query: str) -> str:
     """Get the next query from query_file, or reuse current query if unavailable."""
 
@@ -240,7 +267,13 @@ def main():
 
     try:
         if args.check_stealth:
-            driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+            driver, country_code = create_webdriver(
+                proxy,
+                user_agent,
+                plugin_folder_name,
+                city_name=args.city_name,
+                rsw_id=args.rsw_id,
+            )
             from webdriver import execute_stealth_js_code
 
             execute_stealth_js_code(driver)
@@ -261,7 +294,13 @@ def main():
 
         while True:
             if driver is None:
-                driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+                driver, country_code = create_webdriver(
+                    proxy,
+                    user_agent,
+                    plugin_folder_name,
+                    city_name=args.city_name,
+                    rsw_id=args.rsw_id,
+                )
 
             try:
                 search_controller = SearchController(
@@ -417,12 +456,14 @@ def main():
                     except Exception:
                         pass
 
-                profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
-                _cleanup_reserved_runtime_dir(profile_dir)
-                runtime_driver_dir = (
-                    getattr(driver, "_runtime_driver_dir", None) if driver else None
+                _cleanup_driver_runtime(
+                    driver,
+                    delete_persistent_profile=bool(
+                        getattr(driver, "_runtime_profile_recycle", False)
+                    )
+                    if driver
+                    else False,
                 )
-                _cleanup_reserved_runtime_dir(runtime_driver_dir)
 
                 if proxy and config.webdriver.auth:
                     plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
@@ -461,12 +502,14 @@ def main():
                     except Exception:
                         pass
 
-                profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
-                _cleanup_reserved_runtime_dir(profile_dir)
-                runtime_driver_dir = (
-                    getattr(driver, "_runtime_driver_dir", None) if driver else None
+                _cleanup_driver_runtime(
+                    driver,
+                    delete_persistent_profile=bool(
+                        getattr(driver, "_runtime_profile_recycle", False)
+                    )
+                    if driver
+                    else False,
                 )
-                _cleanup_reserved_runtime_dir(runtime_driver_dir)
 
                 if proxy and config.webdriver.auth:
                     plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
@@ -530,10 +573,12 @@ def main():
         elif driver:
             driver.quit()
 
-        profile_dir = getattr(driver, "_runtime_profile_dir", None) if driver else None
-        _cleanup_reserved_runtime_dir(profile_dir)
-        runtime_driver_dir = getattr(driver, "_runtime_driver_dir", None) if driver else None
-        _cleanup_reserved_runtime_dir(runtime_driver_dir)
+        _cleanup_driver_runtime(
+            driver,
+            delete_persistent_profile=bool(getattr(driver, "_runtime_profile_recycle", False))
+            if driver
+            else False,
+        )
 
         if proxy and config.webdriver.auth:
             plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name

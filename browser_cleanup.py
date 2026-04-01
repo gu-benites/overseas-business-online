@@ -13,6 +13,7 @@ UC_PROFILE_BASE_DIR = PROJECT_ROOT / ".tmp_uc_profiles"
 LEGACY_TMP_UC_PROFILE_BASE_DIR = Path("/tmp/uc_profiles")
 PROXY_AUTH_PLUGIN_BASE_DIR = PROJECT_ROOT / "proxy_auth_plugin"
 ISOLATED_CHROMEDRIVER_BASE_DIR = PROJECT_ROOT / ".runtime" / "isolated_chromedrivers"
+CITY_PROFILE_BASE_DIR = PROJECT_ROOT / ".runtime" / "city_profiles"
 RUNTIME_RESERVATION_DIR = PROJECT_ROOT / ".runtime" / "cleanup_reservations"
 
 
@@ -175,6 +176,12 @@ def _active_reserved_paths() -> set[str]:
         reservation_path.unlink(missing_ok=True)
 
     return active_paths
+
+
+def list_active_reserved_paths() -> set[str]:
+    """Public wrapper for active reserved runtime paths."""
+
+    return _active_reserved_paths()
 
 
 def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:

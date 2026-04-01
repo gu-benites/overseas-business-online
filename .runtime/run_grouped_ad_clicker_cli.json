@@ -1,9 +1,0 @@
-{
-  "pid": 415744,
-  "pgid": 415744,
-  "argv": [
-    "/home/gustavo/overseas-business-online/run_grouped_ad_clicker.py",
-    "--max-concurrent-groups",
-    "4"
-  ]
-}
