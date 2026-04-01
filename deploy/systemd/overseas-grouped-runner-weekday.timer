@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule overseas grouped runner on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri 06:00
+Persistent=true
+Unit=overseas-grouped-runner-weekday.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Stop and clean overseas grouped runner (saturday)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=otavio
+WorkingDirectory=/home/otavio/overseas-business-online
+Environment=TZ=America/Sao_Paulo
+ExecStart=/home/otavio/overseas-business-online/scripts/systemd_stop_and_cleanup.sh
+StandardOutput=append:/home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_systemd.log
+StandardError=append:/home/otavio/overseas-business-online/.streamlit_logs/grouped_runner_systemd.log
+
+[Install]
+WantedBy=multi-user.target

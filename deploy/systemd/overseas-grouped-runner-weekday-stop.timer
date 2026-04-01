@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule stop and cleanup for overseas grouped runner on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri 15:15
+Persistent=true
+Unit=overseas-grouped-runner-weekday-stop.service
+
+[Install]
+WantedBy=timers.target
