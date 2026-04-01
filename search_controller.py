@@ -3,6 +3,7 @@ import json
 import random
 import urllib.parse
 import unicodedata
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import re
@@ -48,13 +49,44 @@ from webdriver import execute_presearch_trust_js_code, execute_stealth_js_code
 
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
-AdList = list[tuple[LinkElement, str, str]]
+AdList = list[tuple[LinkElement, str, str, int]]
 NonAdList = list[LinkElement]
 AllLinks = list[Union[AdList, NonAdList]]
 
 
 class BrowserSessionUnavailableError(RuntimeError):
     """Raised when the local Chrome/WebDriver session disappears mid-run."""
+
+
+class BrowserClickRecoveryRequired(BrowserSessionUnavailableError):
+    """Raised when the search-result click likely happened, but the browser died before landing handling."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        click_url: str,
+        category: str,
+        is_ad_element: bool,
+        click_time: str,
+        stats_snapshot: SearchStats,
+        active_proxy: Optional[str],
+        user_agent: Optional[str],
+        result_position: Optional[int],
+        result_url: Optional[str],
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.click_url = click_url
+        self.category = category
+        self.is_ad_element = is_ad_element
+        self.click_time = click_time
+        self.stats_snapshot = deepcopy(stats_snapshot)
+        self.active_proxy = active_proxy
+        self.user_agent = user_agent
+        self.result_position = result_position
+        self.result_url = result_url
 
 
 class SearchController:
@@ -81,9 +113,15 @@ class SearchController:
     CAPTCHA_DIALOG = (By.CSS_SELECTOR, "div[aria-label^='Captcha-Dialog']")
     CAPTCHA_IFRAME = (By.CSS_SELECTOR, "iframe[title='Captcha']")
     RECAPTCHA = (By.ID, "recaptcha")
+    CAPTCHA_SITEKEY = (By.CSS_SELECTOR, "#recaptcha, [data-sitekey]")
     BLOCK_PAGE_MARKERS = (
         "Our systems have detected unusual traffic",
         "Please try your request again later.",
+    )
+    CAPTCHA_URL_MARKERS = (
+        "/sorry/",
+        "/sorry/index",
+        "recaptcha",
     )
     RESULTS_READY_SELECTORS = (
         (By.ID, "appbar"),
@@ -129,6 +167,19 @@ class SearchController:
         "reject",
         "decline all",
         "decline",
+    )
+    LOCATION_DISMISS_ACTION_PHRASES = (
+        "not now",
+        "agora nao",
+        "agora não",
+        "jetzt nicht",
+        "ahora no",
+    )
+    LOCATION_CONTINUE_ACTION_PHRASES = (
+        "continue",
+        "continuar",
+        "weiter",
+        "prosseguir",
     )
     UNRELATED_UI_BUTTON_PHRASES = (
         "upload",
@@ -206,6 +257,7 @@ class SearchController:
         self._stats = SearchStats()
         query_slug = re.sub(r"[^a-z0-9]+", "-", self._search_query.lower()).strip("-") or "query"
         self._run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{query_slug[:40]}"
+        self._click_sequence = 0
         self._screenshot_root = Path.cwd() / ".run_screenshots" / self._run_id
         self._screenshot_root.mkdir(parents=True, exist_ok=True)
         self._screenshot_counter = 0
@@ -289,7 +341,6 @@ class SearchController:
         self._wait_for_page_settle()
         self._ensure_browser_session_alive("after_second_settle")
         self._record_proxy_ip_checkpoint("session_start")
-        self._check_captcha()
         self._abort_if_google_blocked("search_start")
 
         logger.info(f"Starting search for '{self._search_query}'")
@@ -368,6 +419,7 @@ class SearchController:
                 ad_link_element = ad[0]
                 ad_link = ad[1]
                 ad_title = ad[2].replace("\n", " ")
+                result_position = ad[3]
                 logger.info(f"Clicking to [{ad_title}]({ad_link})...")
                 self._save_step_screenshot("shopping_before_click")
 
@@ -375,13 +427,28 @@ class SearchController:
                     hooks.before_ad_click_hook(self._driver)
 
                 if config.behavior.send_to_android and self._android_device_id:
-                    self._handle_android_click(ad_link_element, ad_link, True, category="Shopping")
+                    self._handle_android_click(
+                        ad_link_element,
+                        ad_link,
+                        True,
+                        category="Shopping",
+                        result_position=result_position,
+                        result_url=ad_link,
+                    )
                 else:
                     self._handle_browser_click(
-                        ad_link_element, ad_link, True, original_window_handle, category="Shopping"
+                        ad_link_element,
+                        ad_link,
+                        True,
+                        original_window_handle,
+                        category="Shopping",
+                        result_position=result_position,
+                        result_url=ad_link,
                     )
                 self._save_step_screenshot("shopping_after_click")
 
+            except BrowserSessionUnavailableError:
+                raise
             except Exception as exp:
                 if self._is_browser_session_unavailable_exception(exp):
                     self._abort_due_to_browser_unavailable("shopping_ad_click", exp)
@@ -403,7 +470,9 @@ class SearchController:
             is_ad_element = isinstance(link, tuple)
 
             try:
-                link_element, link_url, ad_title = self._extract_link_info(link, is_ad_element)
+                link_element, link_url, ad_title, result_position = self._extract_link_info(
+                    link, is_ad_element
+                )
 
                 if self._hooks_enabled and is_ad_element:
                     hooks.before_ad_click_hook(self._driver)
@@ -417,10 +486,23 @@ class SearchController:
                 category = "Ad" if is_ad_element else "Non-ad"
 
                 if config.behavior.send_to_android and self._android_device_id:
-                    self._handle_android_click(link_element, link_url, is_ad_element, category)
+                    self._handle_android_click(
+                        link_element,
+                        link_url,
+                        is_ad_element,
+                        category,
+                        result_position=result_position,
+                        result_url=link_url,
+                    )
                 else:
                     self._handle_browser_click(
-                        link_element, link_url, is_ad_element, original_window_handle, category
+                        link_element,
+                        link_url,
+                        is_ad_element,
+                        original_window_handle,
+                        category,
+                        result_position=result_position,
+                        result_url=link_url,
                     )
                 self._save_step_screenshot(
                     f"{'ad' if is_ad_element else 'non_ad'}_after_click"
@@ -435,6 +517,8 @@ class SearchController:
                     "Skipping scroll into view..."
                 )
 
+            except BrowserSessionUnavailableError:
+                raise
             except Exception as exp:
                 if self._is_browser_session_unavailable_exception(exp):
                     self._abort_due_to_browser_unavailable("search_result_click", exp)
@@ -494,12 +578,14 @@ class SearchController:
             link_element = link[0]
             link_url = link[1]
             ad_title = link[2]
+            result_position = link[3]
         else:
             link_element = link
             link_url = link_element.get_attribute("href")
             ad_title = None
+            result_position = None
 
-        return (link_element, link_url, ad_title)
+        return (link_element, link_url, ad_title, result_position)
 
     def _extract_ad_title(self, ad: LinkElement) -> str:
         """Extract a resilient ad title from the SERP card."""
@@ -534,6 +620,8 @@ class SearchController:
         link_url: str,
         is_ad_element: bool,
         category: str = "Ad",
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
     ) -> None:
         """Handle opening link on Android device
 
@@ -573,7 +661,13 @@ class SearchController:
             else link_url
         )
 
-        self._update_click_stats(site_url, click_time, category)
+        self._update_click_stats(
+            site_url,
+            click_time,
+            category,
+            result_position=result_position,
+            result_url=result_url or url,
+        )
 
         if config.behavior.request_boost:
             boost_requests(url)
@@ -592,6 +686,8 @@ class SearchController:
         is_ad_element: bool,
         original_window_handle: str,
         category: str = "Ad",
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
     ) -> None:
         """Handle clicking in the browser
 
@@ -607,14 +703,21 @@ class SearchController:
         :param category: Specifies link category as Ad, Non-ad, or Shopping
         """
 
+        click_time = datetime.now().strftime("%H:%M:%S")
+        clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
+        tab_opened = False
+        click_stage = "before_open_tab"
+
         try:
             self._open_link_in_new_tab(link_element)
+            click_stage = "after_open_tab"
             self._ensure_browser_session_alive("browser_click_after_open_tab")
 
             if len(self._driver.window_handles) != 2:
                 logger.debug("Couldn't click! Scrolling element into view...")
                 self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
                 self._open_link_in_new_tab(link_element)
+                click_stage = "after_retry_open_tab"
                 self._ensure_browser_session_alive("browser_click_after_retry_open_tab")
 
             if len(self._driver.window_handles) != 2:
@@ -622,18 +725,19 @@ class SearchController:
                 return
             else:
                 logger.debug("Opened link in a new tab. Switching to tab...")
+                tab_opened = True
 
             for window_handle in self._driver.window_handles:
                 if window_handle != original_window_handle:
                     self._driver.switch_to.window(window_handle)
+                    click_stage = "after_tab_switch"
                     self._ensure_browser_session_alive("browser_click_after_tab_switch")
-                    click_time = datetime.now().strftime("%H:%M:%S")
                     self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened")
+                    click_stage = "landing_opened"
                     self._ensure_browser_session_alive("browser_click_after_landing_opened")
 
                     sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
                     self._ensure_browser_session_alive("browser_click_after_landing_wait")
-                    clicked_target_url = link_url if is_ad_element else link_element.get_attribute("href")
                     final_landed_url = self._driver.current_url
                     logger.info(f"{category} click target URL: {clicked_target_url}")
                     logger.info(f"{category} final landed URL: {final_landed_url}")
@@ -658,6 +762,8 @@ class SearchController:
                         click_time,
                         category,
                         final_url=final_landed_url,
+                        result_position=result_position,
+                        result_url=result_url or clicked_target_url or link_url,
                     )
 
                     if config.behavior.request_boost:
@@ -674,12 +780,101 @@ class SearchController:
                     self._driver.close()
                     break
 
+            # go back to the original window
             self._driver.switch_to.window(original_window_handle)
             sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
         except Exception as exp:
             if self._is_browser_session_unavailable_exception(exp):
+                if tab_opened and category in ("Ad", "Shopping"):
+                    logger.warning(
+                        "Browser session disappeared after the result click opened a new tab. "
+                        "Scheduling a fresh-browser landing recovery."
+                    )
+                    raise BrowserClickRecoveryRequired(
+                        str(exp),
+                        stage=click_stage,
+                        click_url=clicked_target_url or link_url,
+                        category=category,
+                        is_ad_element=is_ad_element,
+                        click_time=click_time,
+                        stats_snapshot=self._stats,
+                        active_proxy=getattr(self._driver, "_active_proxy", None),
+                        user_agent=getattr(self._driver, "_active_user_agent", None),
+                        result_position=result_position,
+                        result_url=result_url or clicked_target_url or link_url,
+                    ) from exp
                 self._abort_due_to_browser_unavailable("browser_click", exp)
             raise
+
+    def recover_interrupted_click(
+        self,
+        click_url: str,
+        *,
+        category: str,
+        is_ad_element: bool,
+        click_time: str,
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
+    ) -> None:
+        """Recover a click whose landing handling was interrupted by a local browser crash."""
+
+        logger.warning(
+            "Recovering interrupted %s click in a fresh browser session: %s",
+            category.lower(),
+            click_url,
+        )
+
+        execute_stealth_js_code(self._driver)
+
+        if config.webdriver.use_seleniumbase:
+            self._driver.uc_open_with_reconnect(click_url, reconnect_time=3)
+        else:
+            self._driver.get(click_url)
+
+        self._ensure_browser_session_alive("click_recovery_after_direct_open")
+        self._wait_for_page_settle(timeout=6)
+        self._ensure_browser_session_alive("click_recovery_after_settle")
+        self._save_step_screenshot(f"{category.lower().replace('-', '_')}_landing_opened_recovery")
+
+        sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
+        self._ensure_browser_session_alive("click_recovery_after_landing_wait")
+
+        final_landed_url = self._driver.current_url
+        logger.info(f"{category} recovery target URL: {click_url}")
+        logger.info(f"{category} recovery landed URL: {final_landed_url}")
+
+        if self._hooks_enabled and category in ("Ad", "Shopping"):
+            hooks.after_ad_click_hook(self._driver)
+
+        self._maybe_click_whatsapp_interaction(category)
+        self._ensure_browser_session_alive("click_recovery_after_whatsapp")
+        self._start_random_action_threads()
+        self._ensure_browser_session_alive("click_recovery_after_random_actions")
+
+        url = (
+            "/".join(final_landed_url.split("/", maxsplit=3)[:3])
+            if category == "Shopping"
+            else (click_url if is_ad_element else final_landed_url)
+        )
+        self._update_click_stats(
+            url,
+            click_time,
+            category,
+            final_url=final_landed_url,
+            result_position=result_position,
+            result_url=result_url or click_url,
+        )
+
+        if config.behavior.request_boost:
+            boost_requests(final_landed_url)
+
+        wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
+        logger.debug(f"Waiting {wait_time} seconds on recovered {category.lower()} page...")
+        sleep(wait_time)
+        self._ensure_browser_session_alive("click_recovery_before_landing_close")
+        self._save_step_screenshot(
+            f"{category.lower().replace('-', '_')}_landing_before_close_recovery"
+        )
 
     def _maybe_click_whatsapp_interaction(self, category: str) -> None:
         """Optionally click a visible WhatsApp-style CTA on the landing page."""
@@ -703,6 +898,7 @@ class SearchController:
             f"tag={candidate['tag']}, text={candidate['text']!r}, href={candidate['href']!r}"
         )
         self._save_step_screenshot(f"{category.lower().replace('-', '_')}_whatsapp_before_click")
+
         try:
             self._driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
@@ -792,9 +988,6 @@ class SearchController:
                 ).lower()
                 attr_lower = " ".join(part for part in (element_id, class_name) if part).lower()
 
-                if any(token in text_lower for token in self.UNRELATED_UI_BUTTON_PHRASES):
-                    continue
-
                 score = 0
                 if any(token in href_lower for token in self.WHATSAPP_HREF_HINTS):
                     score += 100
@@ -867,6 +1060,446 @@ class SearchController:
         except Exception as exp:
             if self._is_browser_session_unavailable_exception(exp):
                 self._abort_due_to_browser_unavailable("open_link_in_new_tab", exp)
+            raise
+
+    def _get_wait_time(self, is_ad_element: bool) -> int:
+        """Get wait time based on whether the link is an ad or non-ad
+
+        :type is_ad_element: bool
+        :param is_ad_element: Whether it is an ad or non-ad link
+        :rtype: int
+        :returns: Randomly selected number from the given range
+        """
+
+        if is_ad_element:
+            return random.choice(range(self._ad_page_min_wait, self._ad_page_max_wait))
+        else:
+            return random.choice(range(self._nonad_page_min_wait, self._nonad_page_max_wait))
+
+    def _next_click_id(self) -> str:
+        self._click_sequence += 1
+        return f"{self._run_id}_click_{self._click_sequence:03d}"
+
+    def _update_click_stats(
+        self,
+        url: str,
+        click_time: str,
+        category: str,
+        final_url: str | None = None,
+        result_position: Optional[int] = None,
+        result_url: Optional[str] = None,
+    ) -> None:
+        """Update click statistics
+
+        :type url: str
+        :param url: Clicked link url to save db
+        :type click_time: str
+        :param click_time: Click time in hh:mm:ss format
+        :type category: str
+        :param category: Specifies link category as Ad, Non-ad, or Shopping
+        """
+
+        if category == "Ad":
+            self._stats.ads_clicked += 1
+        elif category == "Non-ad":
+            self._stats.non_ads_clicked += 1
+        elif category == "Shopping":
+            self._stats.shopping_ads_clicked += 1
+
+        click_id = self._next_click_id()
+        self._clicklogs_db_client.save_click(
+            site_url=url,
+            category=category,
+            query=self._search_query,
+            click_time=click_time,
+            city_name=self._city_name,
+            rsw_id=self._rsw_id,
+            final_url=final_url,
+            grouped_cycle_id=self._grouped_cycle_id,
+            click_id=click_id,
+            search_run_id=self._run_id,
+            result_position=result_position,
+            result_url=result_url or url,
+        )
+
+    def _start_random_scroll_thread(self) -> None:
+        """Start a thread for random swipes on Android device"""
+
+        random_scroll_thread = Thread(target=self._make_random_swipes)
+        random_scroll_thread.start()
+        random_scroll_thread.join(
+            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
+        )
+
+    def _start_random_action_threads(self) -> None:
+        """Start threads for random actions on browser"""
+
+        random_scroll_thread = Thread(target=self._make_random_scrolls)
+        random_scroll_thread.start()
+        random_mouse_thread = Thread(target=self._make_random_mouse_movements)
+        random_mouse_thread.start()
+        random_scroll_thread.join(
+            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
+        )
+        random_mouse_thread.join(
+            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
+        )
+
+    def end_search(self) -> None:
+        """Close the browser.
+
+        Delete cookies and cache before closing.
+        """
+
+        if self._driver:
+            try:
+                self._delete_cache_and_cookies()
+                self._driver.quit()
+
+            except Exception as exp:
+                logger.debug(exp)
+
+            self._driver = None
+
+    def _load(self) -> None:
+        """Load Google main page"""
+
+        execute_presearch_trust_js_code(self._driver)
+        if config.webdriver.use_seleniumbase:
+            self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
+        else:
+            self._driver.get(self.URL)
+
+    def _get_shopping_ad_links(self) -> AdList:
+        """Extract shopping ad links to click if exists
+
+        :rtype: AdList
+        :returns: List of (ad, ad_link, ad_title) tuples
+        """
+
+        ads = []
+
+        try:
+            logger.info("Checking shopping ads...")
+
+            # for mobile user-agents
+            mobile_shopping_ads = self._driver.find_elements(By.CLASS_NAME, "pla-unit-container")
+            if mobile_shopping_ads:
+                for shopping_index, shopping_ad in enumerate(mobile_shopping_ads[:5], start=1):
+                    ad = shopping_ad.find_element(By.TAG_NAME, "a")
+                    shopping_ad_link = ad.get_attribute("href")
+                    shopping_ad_title = shopping_ad.text.strip()
+                    shopping_ad_target_link = shopping_ad_link
+
+                    ad_fields = (
+                        shopping_ad,
+                        shopping_ad_link,
+                        shopping_ad_title,
+                        shopping_ad_target_link,
+                        shopping_index,
+                    )
+                    logger.debug(ad_fields)
+
+                    ads.append(ad_fields)
+
+            else:
+                commercial_unit_containers = self._driver.find_elements(
+                    By.CLASS_NAME,
+                    "cu-container",
+                )
+                if not commercial_unit_containers:
+                    logger.info("No shopping ads are shown!")
+                    return []
+
+                commercial_unit_container = commercial_unit_containers[0]
+                shopping_ads = commercial_unit_container.find_elements(By.CLASS_NAME, "pla-unit")
+
+                for shopping_index, shopping_ad in enumerate(shopping_ads[:5], start=1):
+                    ad = shopping_ad.find_element(By.TAG_NAME, "a")
+                    shopping_ad_link = ad.get_attribute("href")
+
+                    ad_data_element = shopping_ad.find_element(By.CSS_SELECTOR, "a:nth-child(2)")
+                    shopping_ad_title = ad_data_element.get_attribute("aria-label")
+                    shopping_ad_target_link = ad_data_element.get_attribute("href")
+
+                    ad_fields = (
+                        shopping_ad,
+                        shopping_ad_link,
+                        shopping_ad_title,
+                        shopping_ad_target_link,
+                        shopping_index,
+                    )
+                    logger.debug(ad_fields)
+
+                    ads.append(ad_fields)
+
+            self._stats.shopping_ads_found = len(ads)
+
+            if not ads:
+                return []
+
+            # if there are filter words given, filter results accordingly
+            filtered_ads = []
+
+            if self._filter_words:
+                for ad in ads:
+                    ad_title = ad[2].replace("\n", " ")
+                    ad_link = ad[3]
+
+                    for word in self._filter_words:
+                        if word in ad_link or word in ad_title.lower():
+                            if ad not in filtered_ads:
+                                logger.debug(f"Filtering [{ad_title}]: {ad_link}")
+                                self._stats.num_filtered_shopping_ads += 1
+                                filtered_ads.append(ad)
+            else:
+                filtered_ads = ads
+
+            shopping_ad_links = []
+
+            for ad in filtered_ads:
+                ad_link = ad[1]
+                ad_title = ad[2].replace("\n", " ")
+                ad_target_link = ad[3]
+                ad_position = ad[4]
+                logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
+
+                if self._exclude_list:
+                    for exclude_item in self._exclude_list:
+                        if (
+                            exclude_item in ad_target_link
+                            or exclude_item.lower() in ad_title.lower()
+                        ):
+                            logger.debug(f"Excluding [{ad_title}]: {ad_target_link}")
+                            self._stats.num_excluded_shopping_ads += 1
+                            break
+                    else:
+                        logger.info("======= Found a Shopping Ad =======")
+                        shopping_ad_links.append((ad[0], ad_link, ad_title, ad_position))
+                else:
+                    logger.info("======= Found a Shopping Ad =======")
+                    shopping_ad_links.append((ad[0], ad_link, ad_title, ad_position))
+
+            return shopping_ad_links
+
+        except NoSuchElementException:
+            logger.info("No shopping ads are shown!")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("shopping_ad_scan", exp)
+            raise
+
+        return ads
+
+    def _get_ad_links(self) -> AdList:
+        """Extract ad links to click
+
+        :rtype: AdList
+        :returns: List of (ad, ad_link, ad_title) tuples
+        """
+
+        logger.info("Getting ad links...")
+        try:
+            ads = []
+
+            scroll_count = 0
+
+            logger.debug(f"Max scroll limit: {self._max_scroll_limit}")
+
+            while not self._is_scroll_at_the_end():
+                try:
+                    top_ads_containers = self._driver.find_elements(*self.TOP_ADS_CONTAINER)
+                    for ad_container in top_ads_containers:
+                        ads.extend(ad_container.find_elements(*self.AD_RESULTS))
+
+                except NoSuchElementException:
+                    logger.debug("Could not found top ads!")
+
+                try:
+                    bottom_ads_containers = self._driver.find_elements(*self.BOTTOM_ADS_CONTAINER)
+                    for ad_container in bottom_ads_containers:
+                        ads.extend(ad_container.find_elements(*self.AD_RESULTS))
+
+                except NoSuchElementException:
+                    logger.debug("Could not found bottom ads!")
+
+                if self._max_scroll_limit > 0:
+                    if scroll_count == self._max_scroll_limit:
+                        logger.debug("Reached to max scroll limit! Ending scroll...")
+                        break
+
+                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
+                sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+
+                scroll_count += 1
+
+            if not ads:
+                return []
+
+            # clean non-ad links and duplicates
+            cleaned_ads = []
+            links = []
+
+            for ad in ads:
+                if ad.get_attribute("data-pcu"):
+                    ad_link = ad.get_attribute("href")
+
+                    if ad_link not in links:
+                        links.append(ad_link)
+                        cleaned_ads.append(ad)
+            ad_positions = {id(ad): position for position, ad in enumerate(cleaned_ads, start=1)}
+
+            self._stats.ads_found = len(cleaned_ads)
+
+            # if there are filter words given, filter results accordingly
+            filtered_ads = []
+
+            if self._filter_words:
+                for ad in cleaned_ads:
+                    ad_title = self._extract_ad_title(ad).lower()
+                    ad_link = ad.get_attribute("data-pcu")
+
+                    logger.debug(f"data-pcu ad_link: {ad_link}")
+
+                    for word in self._filter_words:
+                        if word in ad_link or word in ad_title:
+                            if ad not in filtered_ads:
+                                logger.debug(f"Filtering [{ad_title}]: {ad_link}")
+                                self._stats.num_filtered_ads += 1
+                                filtered_ads.append(ad)
+            else:
+                filtered_ads = cleaned_ads
+
+            ad_links = []
+
+            for ad in filtered_ads:
+                ad_link = ad.get_attribute("href")
+                ad_target_link = ad.get_attribute("data-pcu") or ad_link
+                ad_title = self._extract_ad_title(ad)
+                ad_position = ad_positions.get(id(ad))
+                logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
+
+                if self._ad_allowlist:
+                    if not any(
+                        domain_matches_url(domain, ad_target_link)
+                        for domain in self._ad_allowlist
+                    ):
+                        logger.debug(
+                            f"Skipping [{ad_title}] because it is not in ad_allowlist: "
+                            f"{ad_target_link}"
+                        )
+                        self._stats.num_filtered_ads += 1
+                        continue
+
+                if self._ad_denylist:
+                    if any(
+                        domain_matches_url(domain, ad_target_link)
+                        for domain in self._ad_denylist
+                    ):
+                        logger.debug(
+                            f"Skipping [{ad_title}] because it is in ad_denylist: "
+                            f"{ad_target_link}"
+                        )
+                        self._stats.num_excluded_ads += 1
+                        continue
+
+                if self._exclude_list:
+                    for exclude_item in self._exclude_list:
+                        if (
+                            exclude_item in ad_target_link
+                            or exclude_item.lower() in ad_title.lower()
+                        ):
+                            logger.debug(f"Excluding [{ad_title}]: {ad_link}")
+                            self._stats.num_excluded_ads += 1
+                            break
+                    else:
+                        logger.info("======= Found an Ad =======")
+                        ad_links.append((ad, ad_link, ad_title, ad_position))
+                else:
+                    logger.info("======= Found an Ad =======")
+                    ad_links.append((ad, ad_link, ad_title, ad_position))
+
+            return ad_links
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("ad_scan", exp)
+            raise
+
+    def _get_non_ad_links(
+        self, ad_links: AdList, non_ad_domains: Optional[list[str]] = None
+    ) -> NonAdList:
+        """Extract non-ad link elements
+
+        :type ad_links: AdList
+        :param ad_links: List of ad links found to exclude
+        :type non_ad_domains: list
+        :param non_ad_domains: List of domains to select for non-ad links
+        :rtype: NonAdList
+        :returns: List of non-ad link elements
+        """
+
+        logger.info("Getting non-ad links...")
+        try:
+            # go to top of the page
+            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
+
+            all_links = self._driver.find_elements(*self.ALL_LINKS)
+
+            logger.debug(f"len(all_links): {len(all_links)}")
+
+            non_ad_links = []
+
+            for link in all_links:
+                for ad in ad_links:
+                    if link == ad[0]:
+                        # skip ad element
+                        break
+                else:
+                    link_url = link.get_attribute("href")
+                    if (
+                        link_url
+                        and (
+                            link.get_attribute("role")
+                            not in (
+                                "link",
+                                "button",
+                                "menuitem",
+                                "menuitemradio",
+                            )
+                        )
+                        and link.get_attribute("jsname")
+                        and link.get_attribute("data-ved")
+                        and not link.get_attribute("data-rw")
+                        and "/maps" not in link_url
+                        and "/search?q" not in link_url
+                        and "googleadservices" not in link_url
+                        and "https://www.google" not in link_url
+                        and (link_url and link_url.startswith("http"))
+                        and len(link.find_elements(By.TAG_NAME, "svg")) == 0
+                    ):
+                        if non_ad_domains:
+                            logger.debug(f"Evaluating [{link_url}] to add as non-ad link...")
+
+                            for domain in non_ad_domains:
+                                if domain in link_url:
+                                    logger.debug(f"Adding [{link_url}] to non-ad links")
+                                    non_ad_links.append(link)
+                                    break
+                        else:
+                            logger.debug(f"Adding [{link_url}] to non-ad links")
+                            non_ad_links.append(link)
+
+            logger.info(f"Found {len(non_ad_links)} non-ad links")
+
+            # if there is no domain to filter, randomly select 3 links
+            if not non_ad_domains and len(non_ad_links) > 3:
+                logger.info("Randomly selecting 3 from non-ad links...")
+                non_ad_links = random.sample(non_ad_links, k=3)
+
+            return non_ad_links
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("non_ad_scan", exp)
             raise
 
     @staticmethod
@@ -986,10 +1619,7 @@ class SearchController:
                 continue
 
             combined_text = " | ".join(ui_strings)
-            if any(
-                negative_phrase and negative_phrase in combined_text
-                for negative_phrase in normalized_negative
-            ):
+            if any(negative_phrase and negative_phrase in combined_text for negative_phrase in normalized_negative):
                 continue
 
             score = 0
@@ -1082,7 +1712,8 @@ class SearchController:
         try:
             self._driver.execute_script("arguments[0].focus();", search_input_box)
             search_input_box.click()
-            return self._type_humanlike(search_input_box, self._search_query)
+            self._type_humanlike(search_input_box, self._search_query)
+            return True
         except (ElementNotInteractableException, StaleElementReferenceException) as exp:
             logger.debug(f"Search input could not be used for typing: {exp}")
             return False
@@ -1091,400 +1722,6 @@ class SearchController:
                 self._abort_due_to_browser_unavailable("search_query_submission", exp)
             logger.debug(f"Search query submission failed: {exp}")
             return False
-
-    def _get_wait_time(self, is_ad_element: bool) -> int:
-        """Get wait time based on whether the link is an ad or non-ad
-
-        :type is_ad_element: bool
-        :param is_ad_element: Whether it is an ad or non-ad link
-        :rtype: int
-        :returns: Randomly selected number from the given range
-        """
-
-        if is_ad_element:
-            return random.choice(range(self._ad_page_min_wait, self._ad_page_max_wait))
-        else:
-            return random.choice(range(self._nonad_page_min_wait, self._nonad_page_max_wait))
-
-    def _update_click_stats(
-        self,
-        url: str,
-        click_time: str,
-        category: str,
-        final_url: str | None = None,
-    ) -> None:
-        """Update click statistics
-
-        :type url: str
-        :param url: Clicked link url to save db
-        :type click_time: str
-        :param click_time: Click time in hh:mm:ss format
-        :type category: str
-        :param category: Specifies link category as Ad, Non-ad, or Shopping
-        """
-
-        if category == "Ad":
-            self._stats.ads_clicked += 1
-        elif category == "Non-ad":
-            self._stats.non_ads_clicked += 1
-        elif category == "Shopping":
-            self._stats.shopping_ads_clicked += 1
-
-        self._clicklogs_db_client.save_click(
-            site_url=url,
-            category=category,
-            query=self._search_query,
-            click_time=click_time,
-            city_name=self._city_name,
-            rsw_id=self._rsw_id,
-            final_url=final_url,
-            grouped_cycle_id=self._grouped_cycle_id,
-        )
-
-    def _start_random_scroll_thread(self) -> None:
-        """Start a thread for random swipes on Android device"""
-
-        random_scroll_thread = Thread(target=self._make_random_swipes)
-        random_scroll_thread.start()
-        random_scroll_thread.join(
-            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
-        )
-
-    def _start_random_action_threads(self) -> None:
-        """Start threads for random actions on browser"""
-
-        random_scroll_thread = Thread(target=self._make_random_scrolls)
-        random_scroll_thread.start()
-        random_mouse_thread = Thread(target=self._make_random_mouse_movements)
-        random_mouse_thread.start()
-        random_scroll_thread.join(
-            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
-        )
-        random_mouse_thread.join(
-            timeout=float(max(self._ad_page_max_wait, self._nonad_page_max_wait))
-        )
-
-    def end_search(self) -> None:
-        """Close the browser.
-
-        Delete cookies and cache before closing.
-        """
-
-        if self._driver:
-            try:
-                self._delete_cache_and_cookies()
-                self._driver.quit()
-
-            except Exception as exp:
-                logger.debug(exp)
-
-            self._driver = None
-
-    def _load(self) -> None:
-        """Load Google main page"""
-
-        execute_presearch_trust_js_code(self._driver)
-        if config.webdriver.use_seleniumbase:
-            self._driver.uc_open_with_reconnect(self.URL, reconnect_time=3)
-        else:
-            self._driver.get(self.URL)
-
-    def _get_shopping_ad_links(self) -> AdList:
-        """Extract shopping ad links to click if exists
-
-        :rtype: AdList
-        :returns: List of (ad, ad_link, ad_title) tuples
-        """
-
-        ads = []
-
-        try:
-            logger.info("Checking shopping ads...")
-
-            # for mobile user-agents
-            if self._driver.find_elements(By.CLASS_NAME, "pla-unit-container"):
-                mobile_shopping_ads = self._driver.find_elements(
-                    By.CLASS_NAME, "pla-unit-container"
-                )
-                for shopping_ad in mobile_shopping_ads[:5]:
-                    ad = shopping_ad.find_element(By.TAG_NAME, "a")
-                    shopping_ad_link = ad.get_attribute("href")
-                    shopping_ad_title = shopping_ad.text.strip()
-                    shopping_ad_target_link = shopping_ad_link
-
-                    ad_fields = (
-                        shopping_ad,
-                        shopping_ad_link,
-                        shopping_ad_title,
-                        shopping_ad_target_link,
-                    )
-                    logger.debug(ad_fields)
-
-                    ads.append(ad_fields)
-
-            else:
-                commercial_unit_container = self._driver.find_element(By.CLASS_NAME, "cu-container")
-                shopping_ads = commercial_unit_container.find_elements(By.CLASS_NAME, "pla-unit")
-
-                for shopping_ad in shopping_ads[:5]:
-                    ad = shopping_ad.find_element(By.TAG_NAME, "a")
-                    shopping_ad_link = ad.get_attribute("href")
-
-                    ad_data_element = shopping_ad.find_element(By.CSS_SELECTOR, "a:nth-child(2)")
-                    shopping_ad_title = ad_data_element.get_attribute("aria-label")
-                    shopping_ad_target_link = ad_data_element.get_attribute("href")
-
-                    ad_fields = (
-                        shopping_ad,
-                        shopping_ad_link,
-                        shopping_ad_title,
-                        shopping_ad_target_link,
-                    )
-                    logger.debug(ad_fields)
-
-                    ads.append(ad_fields)
-
-            self._stats.shopping_ads_found = len(ads)
-
-            if not ads:
-                return []
-
-            # if there are filter words given, filter results accordingly
-            filtered_ads = []
-
-            if self._filter_words:
-                for ad in ads:
-                    ad_title = ad[2].replace("\n", " ")
-                    ad_link = ad[3]
-
-                    for word in self._filter_words:
-                        if word in ad_link or word in ad_title.lower():
-                            if ad not in filtered_ads:
-                                logger.debug(f"Filtering [{ad_title}]: {ad_link}")
-                                self._stats.num_filtered_shopping_ads += 1
-                                filtered_ads.append(ad)
-            else:
-                filtered_ads = ads
-
-            shopping_ad_links = []
-
-            for ad in filtered_ads:
-                ad_link = ad[1]
-                ad_title = ad[2].replace("\n", " ")
-                ad_target_link = ad[3]
-                logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
-
-                if self._exclude_list:
-                    for exclude_item in self._exclude_list:
-                        if (
-                            exclude_item in ad_target_link
-                            or exclude_item.lower() in ad_title.lower()
-                        ):
-                            logger.debug(f"Excluding [{ad_title}]: {ad_target_link}")
-                            self._stats.num_excluded_shopping_ads += 1
-                            break
-                    else:
-                        logger.info("======= Found a Shopping Ad =======")
-                        shopping_ad_links.append((ad[0], ad_link, ad_title))
-                else:
-                    logger.info("======= Found a Shopping Ad =======")
-                    shopping_ad_links.append((ad[0], ad_link, ad_title))
-
-            return shopping_ad_links
-
-        except NoSuchElementException:
-            logger.info("No shopping ads are shown!")
-
-        return ads
-
-    def _get_ad_links(self) -> AdList:
-        """Extract ad links to click
-
-        :rtype: AdList
-        :returns: List of (ad, ad_link, ad_title) tuples
-        """
-
-        logger.info("Getting ad links...")
-
-        ads = []
-
-        scroll_count = 0
-
-        logger.debug(f"Max scroll limit: {self._max_scroll_limit}")
-
-        while not self._is_scroll_at_the_end():
-            try:
-                top_ads_containers = self._driver.find_elements(*self.TOP_ADS_CONTAINER)
-                for ad_container in top_ads_containers:
-                    ads.extend(ad_container.find_elements(*self.AD_RESULTS))
-
-            except NoSuchElementException:
-                logger.debug("Could not found top ads!")
-
-            try:
-                bottom_ads_containers = self._driver.find_elements(*self.BOTTOM_ADS_CONTAINER)
-                for ad_container in bottom_ads_containers:
-                    ads.extend(ad_container.find_elements(*self.AD_RESULTS))
-
-            except NoSuchElementException:
-                logger.debug("Could not found bottom ads!")
-
-            if self._max_scroll_limit > 0:
-                if scroll_count == self._max_scroll_limit:
-                    logger.debug("Reached to max scroll limit! Ending scroll...")
-                    break
-
-            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
-            sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
-
-            scroll_count += 1
-
-        if not ads:
-            return []
-
-        # clean non-ad links and duplicates
-        cleaned_ads = []
-        links = []
-
-        for ad in ads:
-            if ad.get_attribute("data-pcu"):
-                ad_link = ad.get_attribute("href")
-
-                if ad_link not in links:
-                    links.append(ad_link)
-                    cleaned_ads.append(ad)
-
-        self._stats.ads_found = len(cleaned_ads)
-
-        # if there are filter words given, filter results accordingly
-        filtered_ads = []
-
-        if self._filter_words:
-            for ad in cleaned_ads:
-                ad_title = self._extract_ad_title(ad).lower()
-                ad_link = ad.get_attribute("data-pcu")
-
-                logger.debug(f"data-pcu ad_link: {ad_link}")
-
-                for word in self._filter_words:
-                    if word in ad_link or word in ad_title:
-                        if ad not in filtered_ads:
-                            logger.debug(f"Filtering [{ad_title}]: {ad_link}")
-                            self._stats.num_filtered_ads += 1
-                            filtered_ads.append(ad)
-        else:
-            filtered_ads = cleaned_ads
-
-        ad_links = []
-
-        for ad in filtered_ads:
-            ad_link = ad.get_attribute("href")
-            ad_target_link = ad.get_attribute("data-pcu") or ad_link
-            ad_title = self._extract_ad_title(ad)
-            logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
-
-            if self._ad_allowlist:
-                if not any(domain_matches_url(domain, ad_target_link) for domain in self._ad_allowlist):
-                    logger.debug(f"Skipping [{ad_title}] because it is not in ad_allowlist: {ad_target_link}")
-                    self._stats.num_filtered_ads += 1
-                    continue
-
-            if self._ad_denylist:
-                if any(domain_matches_url(domain, ad_target_link) for domain in self._ad_denylist):
-                    logger.debug(f"Skipping [{ad_title}] because it is in ad_denylist: {ad_target_link}")
-                    self._stats.num_excluded_ads += 1
-                    continue
-
-            if self._exclude_list:
-                for exclude_item in self._exclude_list:
-                    if (
-                        exclude_item in ad_target_link
-                        or exclude_item.lower() in ad_title.lower()
-                    ):
-                        logger.debug(f"Excluding [{ad_title}]: {ad_link}")
-                        self._stats.num_excluded_ads += 1
-                        break
-                else:
-                    logger.info("======= Found an Ad =======")
-                    ad_links.append((ad, ad_link, ad_title))
-            else:
-                logger.info("======= Found an Ad =======")
-                ad_links.append((ad, ad_link, ad_title))
-
-        return ad_links
-
-    def _get_non_ad_links(
-        self, ad_links: AdList, non_ad_domains: Optional[list[str]] = None
-    ) -> NonAdList:
-        """Extract non-ad link elements
-
-        :type ad_links: AdList
-        :param ad_links: List of ad links found to exclude
-        :type non_ad_domains: list
-        :param non_ad_domains: List of domains to select for non-ad links
-        :rtype: NonAdList
-        :returns: List of non-ad link elements
-        """
-
-        logger.info("Getting non-ad links...")
-
-        # go to top of the page
-        self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
-
-        all_links = self._driver.find_elements(*self.ALL_LINKS)
-
-        logger.debug(f"len(all_links): {len(all_links)}")
-
-        non_ad_links = []
-
-        for link in all_links:
-            for ad in ad_links:
-                if link == ad[0]:
-                    # skip ad element
-                    break
-            else:
-                link_url = link.get_attribute("href")
-                if (
-                    link_url
-                    and (
-                        link.get_attribute("role")
-                        not in (
-                            "link",
-                            "button",
-                            "menuitem",
-                            "menuitemradio",
-                        )
-                    )
-                    and link.get_attribute("jsname")
-                    and link.get_attribute("data-ved")
-                    and not link.get_attribute("data-rw")
-                    and "/maps" not in link_url
-                    and "/search?q" not in link_url
-                    and "googleadservices" not in link_url
-                    and "https://www.google" not in link_url
-                    and (link_url and link_url.startswith("http"))
-                    and len(link.find_elements(By.TAG_NAME, "svg")) == 0
-                ):
-                    if non_ad_domains:
-                        logger.debug(f"Evaluating [{link_url}] to add as non-ad link...")
-
-                        for domain in non_ad_domains:
-                            if domain in link_url:
-                                logger.debug(f"Adding [{link_url}] to non-ad links")
-                                non_ad_links.append(link)
-                                break
-                    else:
-                        logger.debug(f"Adding [{link_url}] to non-ad links")
-                        non_ad_links.append(link)
-
-        logger.info(f"Found {len(non_ad_links)} non-ad links")
-
-        # if there is no domain to filter, randomly select 3 links
-        if not non_ad_domains and len(non_ad_links) > 3:
-            logger.info("Randomly selecting 3 from non-ad links...")
-            non_ad_links = random.sample(non_ad_links, k=3)
-
-        return non_ad_links
 
     def _close_cookie_dialog(self) -> bool:
         """If cookie dialog is opened, close it by accepting"""
@@ -1576,10 +1813,17 @@ class SearchController:
             try:
                 if self._driver.find_elements(*selector):
                     return True
-            except Exception:
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("results_ready_probe", exp)
                 return False
 
-        current_url = (self._driver.current_url or "").lower()
+        try:
+            current_url = (self._driver.current_url or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("results_ready_url_probe", exp)
+            return False
         return "/search?" in current_url or "&q=" in current_url
 
     def _open_search_results_directly(self) -> None:
@@ -1598,6 +1842,62 @@ class SearchController:
             if self._is_browser_session_unavailable_exception(exp):
                 self._abort_due_to_browser_unavailable(stage, exp)
             raise
+
+    def _page_has_captcha_indicators(self) -> bool:
+        try:
+            current_url = (self._driver.current_url or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("captcha_url_probe", exp)
+            raise
+
+        if any(marker in current_url for marker in self.CAPTCHA_URL_MARKERS):
+            return True
+
+        try:
+            page_text = (self._driver.page_source or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("captcha_page_source_probe", exp)
+            raise
+
+        return any(
+            marker in page_text
+            for marker in (
+                "g-recaptcha",
+                "data-sitekey",
+                "captcha-dialog",
+                *[marker.lower() for marker in self.BLOCK_PAGE_MARKERS],
+            )
+        )
+
+    def _find_captcha_container(self) -> Optional[selenium.webdriver.remote.webelement.WebElement]:
+        for selector in (self.CAPTCHA_SITEKEY, self.RECAPTCHA):
+            try:
+                elements = self._driver.find_elements(*selector)
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable("captcha_element_probe", exp)
+                raise
+
+            for element in elements:
+                try:
+                    if element.is_displayed():
+                        return element
+                except StaleElementReferenceException:
+                    continue
+                except Exception as exp:
+                    if self._is_browser_session_unavailable_exception(exp):
+                        self._abort_due_to_browser_unavailable(
+                            "captcha_element_visibility_probe",
+                            exp,
+                        )
+                    raise
+
+            if elements:
+                return elements[0]
+
+        return None
 
     def _wait_for_page_settle(self, timeout: int = 8) -> None:
         """Give Google a chance to finish first paint/load before probing the page."""
@@ -1783,7 +2083,7 @@ class SearchController:
     def _check_captcha(self) -> None:
         """Check if captcha exists and solve it if 2captcha is used, otherwise exit"""
 
-        sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+        sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
         try:
             WebDriverWait(self._driver, timeout=5).until(
                 lambda driver: driver.execute_script("return document.readyState") in ("interactive", "complete")
@@ -1792,7 +2092,14 @@ class SearchController:
             logger.debug("Page readiness check timed out before captcha probe.")
 
         try:
-            captcha = self._driver.find_element(*self.RECAPTCHA)
+            if not self._page_has_captcha_indicators():
+                logger.debug("No captcha indicators seen. Continue to search...")
+                return
+
+            captcha = self._find_captcha_container()
+            if not captcha:
+                logger.debug("Captcha indicators were seen, but no captcha container was found.")
+                return
 
             if captcha:
                 logger.error("Captcha was shown.")
@@ -1818,7 +2125,13 @@ class SearchController:
                         self._save_step_screenshot(f"captcha_retry_refresh_{attempt_index:02d}")
                         self._driver.refresh()
                         sleep(get_random_sleep(3, 4) * config.behavior.wait_factor)
-                        captcha = self._driver.find_element(*self.RECAPTCHA)
+                        captcha = self._find_captcha_container()
+                        if not captcha:
+                            logger.warning(
+                                "Captcha container disappeared after refresh retry. "
+                                "Continuing with post-refresh page state."
+                            )
+                            return
 
                     cookies = ";".join(
                         [f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()]
@@ -1884,25 +2197,21 @@ class SearchController:
                     self._driver.quit()
                     raise SystemExit()
 
-        except NoSuchElementException:
-            logger.debug("No captcha seen. Continue to search...")
-        except WebDriverException as exp:
-            exp_text = str(exp).lower()
-            if "tab crashed" in exp_text or "invalid session id" in exp_text:
-                logger.error(
-                    "Browser became unstable while checking captcha presence. "
-                    "Stopping this run cleanly."
-                )
-                try:
-                    self._save_step_screenshot("captcha_check_browser_crashed")
-                except Exception:
-                    pass
-                self._driver.quit()
-                raise SystemExit()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("check_captcha", exp)
+            if isinstance(exp, NoSuchElementException):
+                logger.debug("No captcha seen. Continue to search...")
+                return
             raise
 
     def _is_google_block_page(self) -> bool:
-        page_text = (self._driver.page_source or "").lower()
+        try:
+            page_text = (self._driver.page_source or "").lower()
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("google_block_detection", exp)
+            raise
         return all(marker.lower() in page_text for marker in self.BLOCK_PAGE_MARKERS)
 
     def _abort_if_google_blocked(self, stage: str) -> None:
@@ -1928,11 +2237,11 @@ class SearchController:
             )
             return
 
-        try:
-            self._driver.find_element(*self.RECAPTCHA)
+        remaining_captcha = self._find_captcha_container()
+        if remaining_captcha:
             self._stats.captcha_accepted = False
             logger.warning("Captcha token was applied, but the captcha challenge is still present.")
-        except NoSuchElementException:
+        else:
             self._stats.captcha_accepted = True
             logger.info("Captcha challenge cleared and Google accepted the session.")
 
@@ -2068,49 +2377,69 @@ class SearchController:
         """Close 'Choose location for search results' popup"""
 
         try:
-            estimated_loc_img = self._driver.find_element(*self.ESTIMATED_LOC_IMG)
-            logger.debug(estimated_loc_img.get_attribute("outerHTML"))
+            estimated_loc_images = self._driver.find_elements(*self.ESTIMATED_LOC_IMG)
+            if estimated_loc_images:
+                estimated_loc_img = estimated_loc_images[0]
+                logger.debug(estimated_loc_img.get_attribute("outerHTML"))
+                logger.debug("Closing location choose dialog...")
+                self._click_ui_element(estimated_loc_img, stage="location_dialog_image")
 
-            logger.debug("Closing location choose dialog...")
-            estimated_loc_img.click()
+                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+                continue_button = self._find_best_button_candidate(
+                    self.LOCATION_CONTINUE_ACTION_PHRASES,
+                    negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+                )
+                if continue_button:
+                    logger.debug(continue_button.get_attribute("outerHTML"))
+                    self._click_ui_element(
+                        continue_button,
+                        stage="location_dialog_continue",
+                    )
+                    sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
+                    return
 
             sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
 
-            continue_button = self._driver.find_element(*self.LOC_CONTINUE_BUTTON)
-            logger.debug(continue_button.get_attribute("outerHTML"))
+            logger.debug("Checking alternative location dialog...")
+            logger.debug("Closing location choose dialog by selecting Not now...")
 
-            continue_button.click()
-
-            sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
-
-        except NoSuchElementException:
-
-            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-
-            try:
-                logger.debug("Checking alternative location dialog...")
-                logger.debug("Closing location choose dialog by selecting Not now...")
-
-                not_now_button = self._driver.find_element(*self.NOT_NOW_BUTTON)
-                logger.debug(not_now_button.get_attribute("outerHTML"))
-
-                not_now_button.click()
-
-                sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
-
-            except NoSuchElementException:
+            not_now_button = self._find_best_button_candidate(
+                self.LOCATION_DISMISS_ACTION_PHRASES,
+                negative_phrases=self.UNRELATED_UI_BUTTON_PHRASES,
+            )
+            if not not_now_button:
                 logger.debug("No location choose dialog seen. Continue to search...")
+                return
 
-            except ElementNotInteractableException:
-                logger.debug("Location dialog button element is not interactable!")
+            logger.debug(not_now_button.get_attribute("outerHTML"))
+            self._click_ui_element(not_now_button, stage="location_dialog_not_now")
+            sleep(get_random_sleep(0.2, 0.5) * config.behavior.wait_factor)
+
+        except ElementNotInteractableException:
+            logger.debug("Location dialog button element is not interactable!")
+        except Exception as exp:
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("close_choose_location_popup", exp)
+            raise
 
         finally:
             # if no not now or continue button exists, send ESC to page to close the dialog
-            self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            try:
+                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            except NoSuchElementException:
+                pass
+            except Exception as exp:
+                if self._is_browser_session_unavailable_exception(exp):
+                    self._abort_due_to_browser_unavailable(
+                        "close_choose_location_popup_escape",
+                        exp,
+                    )
+                raise
 
     def _type_humanlike(
         self, element: selenium.webdriver.remote.webelement.WebElement, text: str
-    ) -> bool:
+    ) -> None:
         """Type text slowly like a human
 
         :type element: selenium.webdriver.remote.webelement.WebElement
@@ -2121,17 +2450,27 @@ class SearchController:
 
         try:
             element.clear()
+        except Exception:
+            pass
 
+        try:
+            element.send_keys(Keys.CONTROL, "a")
+            element.send_keys(Keys.BACKSPACE)
+        except Exception:
+            pass
+
+        try:
             for character in text:
                 element.send_keys(character)
                 sleep(get_random_sleep(0.05, 0.15) * config.behavior.wait_factor)
 
             element.send_keys(Keys.ENTER)
-            return True
 
         except Exception as exp:
             logger.debug(f"Error while typing: {exp}")
-            return False
+            if self._is_browser_session_unavailable_exception(exp):
+                self._abort_due_to_browser_unavailable("type_search_query", exp)
+            raise
 
     def set_browser_id(self, browser_id: Optional[int] = None) -> None:
         """Set browser id in stats if multiple browsers are used

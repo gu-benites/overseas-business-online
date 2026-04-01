@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
@@ -26,10 +27,14 @@ from utils import get_proxy_exit_ip
 
 STAT_PATTERN = re.compile(r"^\|\s*(?P<key>[^|]+?)\s*\|\s*(?P<value>[^|]+?)\s*\|$")
 JSON_SUMMARY_PREFIX = "JSON_SUMMARY:"
+PROJECT_ROOT = Path(__file__).resolve().parent
+USER_HOME = Path.home()
 UC_PROFILE_MARKER = str(UC_PROFILE_BASE_DIR) + "/"
-PROXY_PLUGIN_MARKER = "/home/otavio/overseas-business-online/proxy_auth_plugin/"
-UC_DRIVER_MARKER = "/home/otavio/.local/share/undetected_chromedriver/undetected_chromedriver"
-RUN_CLICK_LOG_DIR = "/home/otavio/overseas-business-online/.streamlit_logs/grouped_click_runs"
+PROXY_PLUGIN_MARKER = str(PROJECT_ROOT / "proxy_auth_plugin") + "/"
+UC_DRIVER_MARKER = str(
+    USER_HOME / ".local" / "share" / "undetected_chromedriver" / "undetected_chromedriver"
+)
+RUN_CLICK_LOG_DIR = str(PROJECT_ROOT / ".streamlit_logs" / "grouped_click_runs")
 PROXY_PAYMENT_REQUIRED_MARKER = "402 Payment Required"
 PROXY_TUNNEL_FAILED_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
 PROXY_PAYMENT_REQUIRED_POLL_SECONDS = 60
@@ -127,14 +132,14 @@ def _build_command(
         ]
     else:
         command = [
-        sys.executable,
-        "ad_clicker.py",
-        "-q",
-        query,
-        "-p",
-        proxy,
-        "--json-summary",
-        "--disable-no-clickable-ads-retry",
+            sys.executable,
+            "ad_clicker.py",
+            "-q",
+            query,
+            "-p",
+            proxy,
+            "--json-summary",
+            "--disable-no-clickable-ads-retry",
         ]
     if city_name:
         command.extend(["--city-name", city_name])
@@ -301,7 +306,6 @@ def _wait_until_proxy_healthy(group: GroupRecord) -> str:
             f"city={group.city_name}, rsw_id={group.rsw_id}"
         )
 
-
 def _preflight_group_proxy(group: GroupRecord) -> str | None:
     if not group.proxy:
         return None
@@ -320,7 +324,6 @@ def _preflight_group_proxy(group: GroupRecord) -> str | None:
         f"city={group.city_name}, rsw_id={group.rsw_id}"
     )
     return _wait_until_proxy_healthy(group)
-
 def _parse_int_stat(value: str | None) -> int:
     if not value:
         return 0
@@ -622,15 +625,30 @@ def _log_cycle_click_summary(grouped_cycle_id: str, run_click_log_path: str | No
         f"Cycle click summary [{grouped_cycle_id}]: {len(click_rows)} successful click(s)."
     )
     appended_lines: list[str] = []
-    for city_name, rsw_id, final_url, click_timestamp, query, category, site_url in click_rows:
+    for (
+        click_id,
+        search_run_id,
+        city_name,
+        rsw_id,
+        final_url,
+        click_timestamp,
+        query,
+        category,
+        result_url,
+        result_position,
+    ) in click_rows:
         logger.info(
             "Cycle click: "
-            f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, final_url={final_url}, "
+            f"city={city_name or '-'}, rsw_id={rsw_id or '-'}, run_id={search_run_id or '-'}, "
+            f"click_id={click_id or '-'}, position={result_position or '-'}, "
+            f"result_url={result_url}, final_url={final_url}, "
             f"timestamp={click_timestamp}, query={query}"
         )
         appended_lines.append(
             f"{click_timestamp} | city={city_name or '-'} | rsw_id={rsw_id or '-'} | "
-            f"query={query} | final_url={final_url}"
+            f"run_id={search_run_id or '-'} | click_id={click_id or '-'} | "
+            f"category={category} | position={result_position or '-'} | "
+            f"query={query} | result_url={result_url} | final_url={final_url}"
         )
     if run_click_log_path and appended_lines:
         with open(run_click_log_path, "a", encoding="utf-8") as file_obj:

@@ -30,6 +30,10 @@ class ClickLogsDB:
         final_url: str | None = None,
         click_timestamp: str | None = None,
         grouped_cycle_id: str | None = None,
+        click_id: str | None = None,
+        search_run_id: str | None = None,
+        result_position: int | None = None,
+        result_url: str | None = None,
     ) -> None:
         """Save click_date, site_url, click_time, query, and category to database
 
@@ -58,8 +62,9 @@ class ClickLogsDB:
                     """
                     INSERT INTO clicklogs (
                         click_date, click_time, site_url, query, category,
-                        city_name, rsw_id, final_url, click_timestamp, grouped_cycle_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        city_name, rsw_id, final_url, click_timestamp, grouped_cycle_id,
+                        click_id, search_run_id, result_position, result_url
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         click_date,
@@ -72,11 +77,17 @@ class ClickLogsDB:
                         final_url,
                         resolved_timestamp,
                         grouped_cycle_id,
+                        click_id,
+                        search_run_id,
+                        result_position,
+                        result_url,
                     ),
                 )
                 log_details = (
                     f"{click_date} {click_time}, {site_url}, {query}, {category}, "
-                    f"city={city_name}, rsw_id={rsw_id}, final_url={final_url}, cycle={grouped_cycle_id}"
+                    f"city={city_name}, rsw_id={rsw_id}, final_url={final_url}, cycle={grouped_cycle_id}, "
+                    f"click_id={click_id}, run_id={search_run_id}, position={result_position}, "
+                    f"result_url={result_url}"
                 )
                 logger.debug(f"Click log ({log_details}) was added to database.")
 
@@ -131,7 +142,11 @@ class ClickLogsDB:
                     rsw_id TEXT,
                     final_url TEXT,
                     click_timestamp TEXT,
-                    grouped_cycle_id TEXT
+                    grouped_cycle_id TEXT,
+                    click_id TEXT,
+                    search_run_id TEXT,
+                    result_position INTEGER,
+                    result_url TEXT
                 );"""
             )
             existing_columns = {
@@ -144,29 +159,72 @@ class ClickLogsDB:
                 ("final_url", "ALTER TABLE clicklogs ADD COLUMN final_url TEXT"),
                 ("click_timestamp", "ALTER TABLE clicklogs ADD COLUMN click_timestamp TEXT"),
                 ("grouped_cycle_id", "ALTER TABLE clicklogs ADD COLUMN grouped_cycle_id TEXT"),
+                ("click_id", "ALTER TABLE clicklogs ADD COLUMN click_id TEXT"),
+                ("search_run_id", "ALTER TABLE clicklogs ADD COLUMN search_run_id TEXT"),
+                ("result_position", "ALTER TABLE clicklogs ADD COLUMN result_position INTEGER"),
+                ("result_url", "ALTER TABLE clicklogs ADD COLUMN result_url TEXT"),
             ):
                 if column_name not in existing_columns:
                     clicklogs_db_cursor.execute(column_sql)
+            clicklogs_db_cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clicklogs_cycle_timestamp "
+                "ON clicklogs(grouped_cycle_id, click_timestamp, id)"
+            )
+            clicklogs_db_cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clicklogs_run_id ON clicklogs(search_run_id)"
+            )
+            clicklogs_db_cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clicklogs_click_id ON clicklogs(click_id)"
+            )
 
     def query_clicks_for_cycle(
         self, grouped_cycle_id: str
-    ) -> list[tuple[str, str, str, str, str, str, str]]:
+    ) -> list[tuple[str, str, str, str, str, str, str, str, str, int | None]]:
         with self._clicklogs_db() as clicklogs_db_cursor:
             clicklogs_db_cursor.execute(
                 """
                 SELECT
+                    COALESCE(click_id, ''),
+                    COALESCE(search_run_id, ''),
                     COALESCE(city_name, ''),
                     COALESCE(rsw_id, ''),
                     COALESCE(final_url, site_url),
                     COALESCE(click_timestamp, click_date || 'T' || click_time),
                     query,
                     category,
-                    site_url
+                    COALESCE(result_url, site_url),
+                    result_position
                 FROM clicklogs
                 WHERE grouped_cycle_id = ?
                 ORDER BY click_timestamp ASC, id ASC
                 """,
                 (grouped_cycle_id,),
+            )
+            return clicklogs_db_cursor.fetchall()
+
+    def query_click_events_by_date(
+        self, click_date: str
+    ) -> list[tuple[str, str, str, str, str, str, str, str, str, str, int | None]]:
+        with self._clicklogs_db() as clicklogs_db_cursor:
+            clicklogs_db_cursor.execute(
+                """
+                SELECT
+                    COALESCE(click_id, ''),
+                    COALESCE(search_run_id, ''),
+                    COALESCE(city_name, ''),
+                    COALESCE(rsw_id, ''),
+                    COALESCE(click_timestamp, click_date || 'T' || click_time),
+                    query,
+                    category,
+                    COALESCE(site_url, ''),
+                    COALESCE(result_url, site_url, ''),
+                    COALESCE(final_url, site_url, ''),
+                    result_position
+                FROM clicklogs
+                WHERE click_date = ?
+                ORDER BY click_timestamp ASC, id ASC
+                """,
+                (click_date,),
             )
             return clicklogs_db_cursor.fetchall()
 
