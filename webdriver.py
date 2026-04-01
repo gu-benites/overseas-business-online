@@ -192,6 +192,13 @@ def _apply_browser_locale_overrides(
 
     try:
         effective_user_agent = user_agent or driver.execute_script("return navigator.userAgent")
+        if effective_user_agent and "HeadlessChrome/" in effective_user_agent:
+            normalized_user_agent = effective_user_agent.replace("HeadlessChrome/", "Chrome/")
+            logger.debug(
+                "Normalizing headless user-agent token for coherent native identity: "
+                f"{effective_user_agent} -> {normalized_user_agent}"
+            )
+            effective_user_agent = normalized_user_agent
         override_payload = {"userAgent": effective_user_agent}
         if accept_language:
             override_payload["acceptLanguage"] = accept_language
@@ -809,9 +816,6 @@ def create_webdriver(
             f"--window-size={startup_window_size[0]},{startup_window_size[1]}"
         )
         chrome_options.add_argument("--window-position=0,0")
-    if user_agent:
-        chrome_options.add_argument(f"--user-agent={user_agent}")
-
     if IS_POSIX:
         chrome_options.add_argument("--disable-setuid-sandbox")
 
@@ -853,8 +857,25 @@ def create_webdriver(
         browser_major_version = get_browser_major_version()
         if browser_major_version:
             logger.debug(f"Detected browser major version: {browser_major_version}")
+        effective_user_agent = user_agent
+        if (
+            not effective_user_agent
+            and headless_mode
+            and getattr(config.webdriver, "identity_mode", "native_linux") == "native_linux"
+            and browser_major_version
+        ):
+            effective_user_agent = (
+                f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{browser_major_version}.0.0.0 Safari/537.36"
+            )
+            logger.debug(
+                "Using synthesized native Linux desktop user-agent for headless startup: "
+                f"{effective_user_agent}"
+            )
+        if effective_user_agent:
+            chrome_options.add_argument(f"--user-agent={effective_user_agent}")
         _ensure_local_uc_driver_cache()
-        if getattr(config.webdriver, "isolated_chromedriver_per_run", False):
+        if getattr(config.webdriver, "isolated_chromedriver_per_run", True):
             driver_exe_path, runtime_driver_dir = _prepare_isolated_driver_executable(
                 browser_major_version
             )
@@ -959,7 +980,7 @@ def create_webdriver(
                 driver,
                 locale_code=locale_code,
                 accept_language=accept_language,
-                user_agent=user_agent,
+                user_agent=effective_user_agent,
             )
 
         driver._runtime_profile_dir = str(profile_dir)
@@ -1106,7 +1127,7 @@ def create_seleniumbase_driver(
             driver,
             locale_code=locale_code,
             accept_language=accept_language,
-            user_agent=user_agent,
+            user_agent=effective_user_agent,
         )
 
     # set geolocation and timezone if available

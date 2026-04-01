@@ -10,6 +10,7 @@
         "auth": true,
         "incognito": false,
         "identity_mode": "native_linux",
+        "isolated_chromedriver_per_run": true,
         "country_domain": true,
         "language_from_proxy": true,
         "ss_on_exception": false,
