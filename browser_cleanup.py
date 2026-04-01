@@ -19,6 +19,36 @@ def _list_process_args() -> list[str]:
     return [line.strip() for line in output.splitlines()[1:] if line.strip()]
 
 
+def release_runtime_dir(path: str | Path | None) -> bool:
+    """
+    Compatibility shim for the older ad_clicker cleanup flow.
+
+    The modern runtime model already uses isolated per-run directories and
+    cleans stale ones by checking whether any live process still references the
+    path. `ad_clicker.py` still calls `release_runtime_dir()` before deleting a
+    profile/driver/plugin directory, so keep that API and align it with the
+    current ownership model:
+
+    - return True when the path is absent or no live process references it
+    - return False when a live process command line still contains that path
+    """
+
+    if not path:
+        return True
+
+    runtime_dir = Path(path)
+    if not runtime_dir.exists():
+        return True
+
+    runtime_dir_str = str(runtime_dir)
+    try:
+        process_args = _list_process_args()
+    except Exception:
+        return False
+
+    return not any(runtime_dir_str in args for args in process_args)
+
+
 def cleanup_stale_uc_profiles(max_age_seconds: int = 1800) -> dict[str, int]:
     """
     Remove old browser runtime directories that are no longer referenced by any process.
