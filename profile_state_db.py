@@ -35,10 +35,18 @@ def _slugify_city(city_name: str) -> str:
     return normalized or "city"
 
 
-def build_profile_key(city_name: str, key_mode: str = "city") -> str:
+def build_profile_key(
+    city_name: str,
+    key_mode: str = "city",
+    slot_index: int | None = None,
+) -> str:
     if key_mode != "city":
         raise ValueError(f"Unsupported profile reuse key mode: {key_mode}")
-    return _slugify_city(city_name)
+    base_key = _slugify_city(city_name)
+    normalized_slot = max(1, int(slot_index or 1))
+    if normalized_slot == 1:
+        return base_key
+    return f"{base_key}--slot-{normalized_slot}"
 
 
 @dataclass(slots=True)

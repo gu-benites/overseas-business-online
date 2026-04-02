@@ -155,6 +155,11 @@ def get_arg_parser() -> ArgumentParser:
     arg_parser.add_argument("--rsw-id", help="RSW ID context for grouped runner click logs")
     arg_parser.add_argument("--grouped-cycle-id", help="Grouped runner cycle id for click log aggregation")
     arg_parser.add_argument(
+        "--group-slot",
+        type=int,
+        help="Dynamic grouped-runner slot number for same-city parallelism",
+    )
+    arg_parser.add_argument(
         "--json-summary",
         action="store_true",
         help="Print machine-readable run summary for automation consumers",
@@ -273,6 +278,7 @@ def main():
                 plugin_folder_name,
                 city_name=args.city_name,
                 rsw_id=args.rsw_id,
+                profile_slot=args.group_slot,
             )
             from webdriver import execute_stealth_js_code
 
@@ -300,6 +306,7 @@ def main():
                     plugin_folder_name,
                     city_name=args.city_name,
                     rsw_id=args.rsw_id,
+                    profile_slot=args.group_slot,
                 )
 
             try:

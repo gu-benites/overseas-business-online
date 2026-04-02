@@ -241,6 +241,7 @@ def _prepare_profile_runtime(
     city_name: Optional[str],
     rsw_id: Optional[str],
     proxy: Optional[str],
+    profile_slot: Optional[int],
 ) -> dict[str, object]:
     """Resolve either a reusable city profile or a per-run ephemeral profile."""
 
@@ -262,7 +263,11 @@ def _prepare_profile_runtime(
     current_proxy_session_id = _extract_proxy_session_id(proxy) if proxy else None
 
     if reuse_enabled and city_name:
-        profile_key = build_profile_key(city_name, reuse_key_mode)
+        profile_key = build_profile_key(
+            city_name,
+            reuse_key_mode,
+            slot_index=profile_slot,
+        )
         state = profile_state_db.ensure_profile(
             profile_key=profile_key,
             city_name=city_name,
@@ -290,6 +295,7 @@ def _prepare_profile_runtime(
                     "kind": "city_profile",
                     "profile_key": profile_key,
                     "city_name": city_name,
+                    "profile_slot": int(profile_slot or 1),
                 },
             )
         except RuntimeError:
@@ -719,6 +725,7 @@ def create_webdriver(
     *,
     city_name: Optional[str] = None,
     rsw_id: Optional[str] = None,
+    profile_slot: Optional[int] = None,
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
     """Create Selenium Chrome webdriver instance
 
@@ -835,6 +842,7 @@ def create_webdriver(
         city_name=city_name,
         rsw_id=rsw_id,
         proxy=proxy,
+        profile_slot=profile_slot,
     )
     profile_dir = Path(str(profile_runtime["profile_dir"]))
 
@@ -972,6 +980,7 @@ def create_webdriver(
         driver._profile_seed_required = bool(profile_runtime["seed_required"])
         driver._profile_cleanup_policy = str(profile_runtime["cleanup_policy"])
         driver._profile_city_name = city_name
+        driver._profile_slot = max(1, int(profile_slot or 1))
         driver._profile_rsw_id = str(rsw_id) if rsw_id is not None else None
         driver._profile_locale_code = locale_code
         driver._profile_country_code = country_code

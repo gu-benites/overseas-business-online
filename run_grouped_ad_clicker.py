@@ -1,6 +1,7 @@
 import argparse
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
@@ -38,6 +39,13 @@ RUN_CLICK_LOG_DIR = str(PROJECT_ROOT / ".streamlit_logs" / "grouped_click_runs")
 PROXY_PAYMENT_REQUIRED_MARKER = "402 Payment Required"
 PROXY_TUNNEL_FAILED_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
 PROXY_PAYMENT_REQUIRED_POLL_SECONDS = 60
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedGroupRun:
+    group: GroupRecord
+    query: GroupQueryRecord
+    slot_index: int
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -118,6 +126,7 @@ def _build_command(
     city_name: str | None = None,
     rsw_id: str | None = None,
     grouped_cycle_id: str | None = None,
+    group_slot: int | None = None,
 ) -> list[str]:
     if getattr(sys, "frozen", False):
         command = [
@@ -147,14 +156,18 @@ def _build_command(
         command.extend(["--rsw-id", str(rsw_id)])
     if grouped_cycle_id:
         command.extend(["--grouped-cycle-id", grouped_cycle_id])
+    if group_slot and int(group_slot) > 1:
+        command.extend(["--group-slot", str(int(group_slot))])
     return command
 
 
-def _log_planned_group(group: GroupRecord, query: GroupQueryRecord) -> None:
+def _log_planned_group(planned_run: PlannedGroupRun) -> None:
+    group = planned_run.group
+    query = planned_run.query
     logger.info(
         "Planned group rotation: "
         f"city={group.city_name}, rsw_id={group.rsw_id}, enabled={group.enabled}, "
-        f"query_pos={query.position}, query='{query.query_text}'"
+        f"slot={planned_run.slot_index}, query_pos={query.position}, query='{query.query_text}'"
     )
 
 
@@ -324,19 +337,20 @@ def _run_single_group_query_attempt(
     db: GroupsDB,
     group: GroupRecord,
     query: GroupQueryRecord,
+    group_slot: int = 1,
     grouped_cycle_id: str | None = None,
 ) -> dict[str, object]:
     logger.info(
         "Running group: "
         f"city={group.city_name}, rsw_id={group.rsw_id}, "
-        f"query_pos={query.position}, query='{query.query_text}'"
+        f"slot={group_slot}, query_pos={query.position}, query='{query.query_text}'"
     )
 
     run_id = db.create_run(
         group.id,
         status="started",
         query_used=query.query_text,
-        notes=f"city={group.city_name}, rsw_id={group.rsw_id}",
+        notes=f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}",
     )
 
     result = subprocess.run(
@@ -346,6 +360,7 @@ def _run_single_group_query_attempt(
             city_name=group.city_name,
             rsw_id=group.rsw_id,
             grouped_cycle_id=grouped_cycle_id,
+            group_slot=group_slot,
         ),
         capture_output=True,
         text=True,
@@ -375,7 +390,10 @@ def _run_single_group_query_attempt(
     shopping_ads_found = stats.get("Shopping Ads Found")
     shopping_ads_clicked = stats.get("Shopping Ads Clicked")
 
-    notes = f"city={group.city_name}, rsw_id={group.rsw_id}, returncode={result.returncode}"
+    notes = (
+        f"city={group.city_name}, rsw_id={group.rsw_id}, "
+        f"slot={group_slot}, returncode={result.returncode}"
+    )
     if summary_payload:
         notes += (
             ", initial_proxy_ip="
@@ -408,7 +426,7 @@ def _run_single_group_query_attempt(
 
     logger.info(
         "Group run finished: "
-        f"city={group.city_name}, rsw_id={group.rsw_id}, status={status}, "
+        f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}, status={status}, "
         f"initial_proxy_ip={initial_proxy_ip or '-'}, "
         f"latest_proxy_ip={latest_proxy_ip or '-'}, "
         f"ip_changed_mid_session={ip_changed_mid_session or '-'}, "
@@ -452,6 +470,7 @@ def _run_group_once(
     db: GroupsDB,
     group: GroupRecord,
     query: GroupQueryRecord,
+    group_slot: int = 1,
     grouped_cycle_id: str | None = None,
 ) -> None:
     group_queries = db.get_group_queries(group.id)
@@ -465,6 +484,7 @@ def _run_group_once(
             db,
             current_group,
             current_query,
+            group_slot=group_slot,
             grouped_cycle_id=grouped_cycle_id,
         )
         attempted_positions.add(current_query.position)
@@ -483,15 +503,16 @@ def _run_group_once(
         next_query = db.get_next_query_for_group(group.id)
         if not next_query or next_query.position in attempted_positions:
             logger.info(
-                "Grouped runner exhausted same-group query fallback without finding clickable ads: "
-                f"city={group.city_name}, rsw_id={group.rsw_id}, attempted_queries={len(attempted_positions)}"
-            )
-            return
+            "Grouped runner exhausted same-group query fallback without finding clickable ads: "
+            f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}, "
+            f"attempted_queries={len(attempted_positions)}"
+        )
+        return
 
         refreshed_group = db.get_group(group.id) or current_group
         logger.info(
             "No clickable ads found for current group query. Retrying next query in the same group: "
-            f"city={group.city_name}, rsw_id={group.rsw_id}, "
+            f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}, "
             f"previous_query='{current_query.query_text}', next_query='{next_query.query_text}', "
             f"attempt={len(attempted_positions) + 1}/{max_attempts}"
         )
@@ -566,34 +587,116 @@ def _iter_target_groups(db: GroupsDB, group_city: str | None) -> list[GroupRecor
     return [group for group in groups if group.city_name.casefold() == city_filter]
 
 
-def _plan_cycle(db: GroupsDB, group_city: str | None = None) -> list[tuple[GroupRecord, GroupQueryRecord]]:
-    planned: list[tuple[GroupRecord, GroupQueryRecord]] = []
-    for group in _iter_target_groups(db, group_city):
-        query = db.get_next_query_for_group(group.id)
-        if not query:
+def _resolve_group_slot_targets(
+    db: GroupsDB,
+    target_groups: list[GroupRecord],
+    *,
+    desired_slots: int,
+) -> dict[int, int]:
+    slot_targets: dict[int, int] = {}
+    extra_capacity: dict[int, int] = {}
+
+    for group in target_groups:
+        queries = db.get_group_queries(group.id)
+        if not queries:
             logger.warning(
                 f"Skipping active group without queries: city={group.city_name}, rsw_id={group.rsw_id}"
             )
             continue
-        refreshed_group = db.get_group(group.id)
-        if refreshed_group is None:
+        slot_targets[group.id] = 1
+        extra_capacity[group.id] = max(0, len(queries) - 1)
+
+    if not slot_targets:
+        return {}
+
+    remaining_slots = max(0, int(desired_slots) - len(slot_targets))
+    ordered_group_ids = [group.id for group in target_groups if group.id in slot_targets]
+
+    while remaining_slots > 0:
+        progress_made = False
+        for group_id in ordered_group_ids:
+            if remaining_slots <= 0:
+                break
+            if extra_capacity.get(group_id, 0) <= 0:
+                continue
+            slot_targets[group_id] += 1
+            extra_capacity[group_id] -= 1
+            remaining_slots -= 1
+            progress_made = True
+        if not progress_made:
+            break
+
+    return slot_targets
+
+
+def _reserve_query_sequence(
+    db: GroupsDB,
+    group: GroupRecord,
+    *,
+    slot_count: int,
+    advance: bool,
+) -> list[GroupQueryRecord]:
+    if slot_count <= 0:
+        return []
+
+    queries = db.get_group_queries(group.id)
+    if not queries:
+        return []
+
+    unique_count = min(int(slot_count), len(queries))
+    if advance:
+        selected: list[GroupQueryRecord] = []
+        for _ in range(unique_count):
+            query = db.get_next_query_for_group(group.id)
+            if not query or any(existing.position == query.position for existing in selected):
+                break
+            selected.append(query)
+        return selected
+
+    last_position = max(0, int(group.last_query_position or 0))
+    next_index = last_position % len(queries)
+    return [queries[(next_index + offset) % len(queries)] for offset in range(unique_count)]
+
+
+def _plan_cycle(
+    db: GroupsDB,
+    *,
+    group_city: str | None = None,
+    desired_slots: int,
+    advance: bool,
+) -> list[PlannedGroupRun]:
+    target_groups = _iter_target_groups(db, group_city)
+    slot_targets = _resolve_group_slot_targets(db, target_groups, desired_slots=desired_slots)
+    planned: list[PlannedGroupRun] = []
+
+    for group in target_groups:
+        slot_count = slot_targets.get(group.id, 0)
+        if slot_count <= 0:
             continue
-        planned.append((refreshed_group, query))
-    return planned
-
-
-def _plan_cycle_without_advancing(
-    db: GroupsDB, group_city: str | None = None
-) -> list[tuple[GroupRecord, GroupQueryRecord]]:
-    planned: list[tuple[GroupRecord, GroupQueryRecord]] = []
-    for group in _iter_target_groups(db, group_city):
-        query = db.peek_next_query_for_group(group.id)
-        if not query:
-            logger.warning(
-                f"Skipping active group without queries: city={group.city_name}, rsw_id={group.rsw_id}"
+        reserved_queries = _reserve_query_sequence(
+            db,
+            group,
+            slot_count=slot_count,
+            advance=advance,
+        )
+        if not reserved_queries:
+            continue
+        refreshed_group = db.get_group(group.id) or group
+        for slot_index, query in enumerate(reserved_queries, start=1):
+            planned.append(
+                PlannedGroupRun(
+                    group=refreshed_group,
+                    query=query,
+                    slot_index=slot_index,
+                )
             )
-            continue
-        planned.append((group, query))
+
+    if len(planned) > len(slot_targets):
+        logger.info(
+            "Grouped runner expanded cycle plan to better use concurrency: "
+            f"active_groups={len(slot_targets)}, desired_slots={desired_slots}, planned_runs={len(planned)}"
+        )
+
     return planned
 
 
@@ -647,17 +750,18 @@ def _run_cycle(
     run_click_log_path: str | None,
 ) -> bool:
     grouped_cycle_id = datetime.now().strftime("cycle_%Y%m%d_%H%M%S_%f")
-    planned = (
-        _plan_cycle_without_advancing(db, group_city)
-        if dry_run
-        else _plan_cycle(db, group_city)
+    max_concurrent_groups = _resolve_max_concurrent_groups(None)
+    launch_stagger_seconds = _resolve_concurrent_launch_stagger_seconds(None)
+    planned = _plan_cycle(
+        db,
+        group_city=group_city,
+        desired_slots=max_concurrent_groups,
+        advance=not dry_run,
     )
     if not planned:
         logger.info("No runnable active groups found.")
         return False
 
-    max_concurrent_groups = _resolve_max_concurrent_groups(None)
-    launch_stagger_seconds = _resolve_concurrent_launch_stagger_seconds(None)
     logger.info(
         "Grouped runner concurrency limit: "
         f"{max_concurrent_groups} group(s) per cycle."
@@ -668,30 +772,37 @@ def _run_cycle(
             f"{launch_stagger_seconds:.1f} second(s) between concurrent submissions."
         )
 
-    for group, query in planned:
-        _log_planned_group(group, query)
+    for planned_run in planned:
+        _log_planned_group(planned_run)
     if dry_run:
         return True
 
     if max_concurrent_groups == 1:
-        for group, query in planned:
+        for planned_run in planned:
             _cleanup_orphan_browsers()
             _cleanup_stale_uc_profile_dirs()
-            _run_group_once(db, group, query, grouped_cycle_id=grouped_cycle_id)
+            _run_group_once(
+                db,
+                planned_run.group,
+                planned_run.query,
+                group_slot=planned_run.slot_index,
+                grouped_cycle_id=grouped_cycle_id,
+            )
         _log_cycle_click_summary(grouped_cycle_id, run_click_log_path)
         return True
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_concurrent_groups) as executor:
-        for index, (group, query) in enumerate(planned):
+        for index, planned_run in enumerate(planned):
             _cleanup_orphan_browsers()
             _cleanup_stale_uc_profile_dirs()
             futures.append(
                 executor.submit(
                     _run_group_once,
                     db,
-                    group,
-                    query,
+                    planned_run.group,
+                    planned_run.query,
+                    planned_run.slot_index,
                     grouped_cycle_id,
                 )
             )
