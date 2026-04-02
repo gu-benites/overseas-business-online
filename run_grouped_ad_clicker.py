@@ -333,6 +333,15 @@ def _is_yes_stat(value: str | None) -> bool:
     return (value or "").strip().lower() == "yes"
 
 
+def _resolve_group_run_timeout_seconds() -> int:
+    configured = getattr(config.behavior, "group_run_timeout_seconds", 600)
+    try:
+        value = int(configured or 600)
+    except (TypeError, ValueError):
+        value = 600
+    return max(60, value)
+
+
 def _run_single_group_query_attempt(
     db: GroupsDB,
     group: GroupRecord,
@@ -353,22 +362,49 @@ def _run_single_group_query_attempt(
         notes=f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}",
     )
 
-    result = subprocess.run(
-        _build_command(
-            query.query_text,
-            group.proxy,
-            city_name=group.city_name,
-            rsw_id=group.rsw_id,
-            grouped_cycle_id=grouped_cycle_id,
-            group_slot=group_slot,
-        ),
-        capture_output=True,
-        text=True,
+    command = _build_command(
+        query.query_text,
+        group.proxy,
+        city_name=group.city_name,
+        rsw_id=group.rsw_id,
+        grouped_cycle_id=grouped_cycle_id,
+        group_slot=group_slot,
     )
-    output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    timeout_seconds = _resolve_group_run_timeout_seconds()
+    timeout_triggered = False
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    except subprocess.TimeoutExpired as exp:
+        timeout_triggered = True
+        stdout = exp.stdout or ""
+        stderr = exp.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        output = (stdout or "") + ("\n" + stderr if stderr else "")
+        result = subprocess.CompletedProcess(
+            args=command,
+            returncode=124,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        logger.warning(
+            "Group run timed out. "
+            f"city={group.city_name}, rsw_id={group.rsw_id}, slot={group_slot}, "
+            f"query='{query.query_text}', timeout_seconds={timeout_seconds}"
+        )
     stats, summary_payload = _parse_ad_clicker_stats(output)
 
     status = "completed" if result.returncode == 0 else "failed"
+    if timeout_triggered:
+        status = "timed_out"
     if "Exception occurred" in output:
         status = "failed"
     if summary_payload and summary_payload.get("google_blocked_after_captcha"):
@@ -394,6 +430,8 @@ def _run_single_group_query_attempt(
         f"city={group.city_name}, rsw_id={group.rsw_id}, "
         f"slot={group_slot}, returncode={result.returncode}"
     )
+    if timeout_triggered:
+        notes += f", timed_out_after={timeout_seconds}s"
     if summary_payload:
         notes += (
             ", initial_proxy_ip="

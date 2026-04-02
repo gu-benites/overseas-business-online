@@ -71,6 +71,7 @@ class BehaviorParams:
     no_clickable_ads_exit_probability: Optional[float] = 0.3
     no_clickable_ads_max_retries: Optional[int] = 1
     enable_v2_enterprise_fallback: Optional[bool] = False
+    group_run_timeout_seconds: Optional[int] = 600
 
 
 class ConfigReader:
@@ -188,6 +189,9 @@ class ConfigReader:
             ),
             enable_v2_enterprise_fallback=config["behavior"].get(
                 "enable_v2_enterprise_fallback", False
+            ),
+            group_run_timeout_seconds=config["behavior"].get(
+                "group_run_timeout_seconds", 600
             ),
         )
 

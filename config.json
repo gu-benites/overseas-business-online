@@ -52,5 +52,6 @@
         "telegram_enabled": false,
         "send_to_android": false,
         "request_boost": false
+        ,"group_run_timeout_seconds": 600
     }
 }
