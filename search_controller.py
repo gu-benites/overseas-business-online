@@ -33,6 +33,7 @@ from clicklogs_db import ClickLogsDB
 from config_reader import config
 from logger import logger
 from profile_state_db import ProfileStateDB
+from search_impressions_db import SearchImpressionsDB
 from stats import SearchStats
 from utils import (
     Direction,
@@ -273,6 +274,7 @@ class SearchController:
             self._set_start_url(country_code)
 
         self._clicklogs_db_client = ClickLogsDB()
+        self._search_impressions_db_client = SearchImpressionsDB()
         self._profile_state_db = ProfileStateDB()
         self._profile_key = getattr(self._driver, "_profile_key", None)
         self._profile_cleanup_policy = getattr(self._driver, "_profile_cleanup_policy", "ephemeral")
@@ -1092,6 +1094,51 @@ class SearchController:
         self._click_sequence += 1
         return f"{self._run_id}_click_{self._click_sequence:03d}"
 
+    def _extract_target_domain(self, url: str | None) -> str | None:
+        if not url:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or "").lower()
+            return host or None
+        except Exception:
+            return None
+
+    def _save_search_impressions(
+        self,
+        impressions: list[dict[str, object]],
+        *,
+        category: str,
+    ) -> None:
+        if not impressions:
+            return
+
+        normalized_rows: list[dict[str, object]] = []
+        for impression in impressions:
+            shown_url = str(impression.get("shown_url") or "") or None
+            click_url = str(impression.get("click_url") or "") or None
+            normalized_rows.append(
+                {
+                    "category": category,
+                    "result_position": impression.get("result_position"),
+                    "title": impression.get("title"),
+                    "shown_url": shown_url,
+                    "click_url": click_url,
+                    "target_domain": self._extract_target_domain(shown_url or click_url),
+                    "eligible_for_click": bool(impression.get("eligible_for_click", False)),
+                    "filter_reason": impression.get("filter_reason"),
+                }
+            )
+
+        self._search_impressions_db_client.save_impressions(
+            normalized_rows,
+            search_run_id=self._run_id,
+            query=self._search_query,
+            city_name=self._city_name,
+            rsw_id=self._rsw_id,
+            grouped_cycle_id=self._grouped_cycle_id,
+        )
+
     def _update_click_stats(
         self,
         url: str,
@@ -1435,6 +1482,8 @@ class SearchController:
             if not ads:
                 return []
 
+            impression_rows: list[dict[str, object]] = []
+
             # if there are filter words given, filter results accordingly
             filtered_ads = []
 
@@ -1442,6 +1491,7 @@ class SearchController:
                 for ad in ads:
                     ad_title = ad[2].replace("\n", " ")
                     ad_link = ad[3]
+                    filter_reason = None
 
                     for word in self._filter_words:
                         if word in ad_link or word in ad_title.lower():
@@ -1449,10 +1499,33 @@ class SearchController:
                                 logger.debug(f"Filtering [{ad_title}]: {ad_link}")
                                 self._stats.num_filtered_shopping_ads += 1
                                 filtered_ads.append(ad)
+                                filter_reason = f"filter_word:{word}"
+                    impression_rows.append(
+                        {
+                            "result_position": ad[4],
+                            "title": ad_title,
+                            "shown_url": ad[3],
+                            "click_url": ad[1],
+                            "eligible_for_click": filter_reason is None,
+                            "filter_reason": filter_reason,
+                        }
+                    )
             else:
                 filtered_ads = ads
+                for ad in ads:
+                    impression_rows.append(
+                        {
+                            "result_position": ad[4],
+                            "title": ad[2].replace("\n", " "),
+                            "shown_url": ad[3],
+                            "click_url": ad[1],
+                            "eligible_for_click": True,
+                            "filter_reason": None,
+                        }
+                    )
 
             shopping_ad_links = []
+            blocked_reasons_by_position: dict[int, str] = {}
 
             for ad in filtered_ads:
                 ad_link = ad[1]
@@ -1469,6 +1542,7 @@ class SearchController:
                         ):
                             logger.debug(f"Excluding [{ad_title}]: {ad_target_link}")
                             self._stats.num_excluded_shopping_ads += 1
+                            blocked_reasons_by_position[ad_position] = f"exclude:{exclude_item}"
                             break
                     else:
                         logger.info("======= Found a Shopping Ad =======")
@@ -1476,6 +1550,15 @@ class SearchController:
                 else:
                     logger.info("======= Found a Shopping Ad =======")
                     shopping_ad_links.append((ad[0], ad_link, ad_title, ad_position))
+
+            eligible_positions = {ad[3] for ad in shopping_ad_links}
+            for row in impression_rows:
+                position = int(row["result_position"] or 0)
+                if position in blocked_reasons_by_position:
+                    row["eligible_for_click"] = False
+                    row["filter_reason"] = blocked_reasons_by_position[position]
+                else:
+                    row["eligible_for_click"] = position in eligible_positions
 
             return shopping_ad_links
 
@@ -1568,12 +1651,14 @@ class SearchController:
                 filtered_ads = cleaned_ads
 
             ad_links = []
+            impression_rows: list[dict[str, object]] = []
 
             for ad in filtered_ads:
                 ad_link = ad.get_attribute("href")
                 ad_target_link = ad.get_attribute("data-pcu") or ad_link
                 ad_title = self._extract_ad_title(ad)
                 ad_position = ad_positions.get(id(ad))
+                filter_reason = None
                 logger.debug(f"Ad title: {ad_title}, Ad link: {ad_link}")
 
                 if self._ad_allowlist:
@@ -1586,6 +1671,17 @@ class SearchController:
                             f"{ad_target_link}"
                         )
                         self._stats.num_filtered_ads += 1
+                        filter_reason = "not_in_allowlist"
+                        impression_rows.append(
+                            {
+                                "result_position": ad_position,
+                                "title": ad_title,
+                                "shown_url": ad_target_link,
+                                "click_url": ad_link,
+                                "eligible_for_click": False,
+                                "filter_reason": filter_reason,
+                            }
+                        )
                         continue
 
                 if self._ad_denylist:
@@ -1598,6 +1694,17 @@ class SearchController:
                             f"{ad_target_link}"
                         )
                         self._stats.num_excluded_ads += 1
+                        filter_reason = "in_denylist"
+                        impression_rows.append(
+                            {
+                                "result_position": ad_position,
+                                "title": ad_title,
+                                "shown_url": ad_target_link,
+                                "click_url": ad_link,
+                                "eligible_for_click": False,
+                                "filter_reason": filter_reason,
+                            }
+                        )
                         continue
 
                 if self._exclude_list:
@@ -1608,6 +1715,7 @@ class SearchController:
                         ):
                             logger.debug(f"Excluding [{ad_title}]: {ad_link}")
                             self._stats.num_excluded_ads += 1
+                            filter_reason = f"exclude:{exclude_item}"
                             break
                     else:
                         logger.info("======= Found an Ad =======")
@@ -1615,6 +1723,19 @@ class SearchController:
                 else:
                     logger.info("======= Found an Ad =======")
                     ad_links.append((ad, ad_link, ad_title, ad_position))
+
+                impression_rows.append(
+                    {
+                        "result_position": ad_position,
+                        "title": ad_title,
+                        "shown_url": ad_target_link,
+                        "click_url": ad_link,
+                        "eligible_for_click": filter_reason is None,
+                        "filter_reason": filter_reason,
+                    }
+                )
+
+            self._save_search_impressions(impression_rows, category="Ad")
 
             return ad_links
         except Exception as exp:
